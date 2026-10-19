@@ -1,0 +1,10 @@
+.dotnet-home/
+.nuget/
+**/bin/
+**/obj/
+android/build/
+android/out/
+artifacts/
+artifacts/*.keystore
+phonecam-live-test.png
+*.h264

@@ -1,0 +1,1109 @@
+using System.Net;
+using System.Net.Http;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using Microsoft.Win32;
+using System.IO.MemoryMappedFiles;
+using PhonecamCameraSource;
+
+namespace Phonecam;
+
+public partial class MainWindow : Window
+{
+    private readonly HttpClient _http = new(new SocketsHttpHandler
+    {
+        UseProxy = false,
+        ConnectTimeout = TimeSpan.FromSeconds(6)
+    }) { Timeout = Timeout.InfiniteTimeSpan };
+    private readonly System.Net.Sockets.TcpListener _listener = new(System.Net.IPAddress.Loopback, 18766);
+    private CancellationTokenSource? _streamCancellation;
+    private byte[]? _latestCameraFrame;
+    private Process? _cameraHost;
+    private Uri? _settingsUri;
+    private bool _updatingPhoneSettings;
+    private readonly SemaphoreSlim _settingsUpdate = new(1, 1);
+    private CancellationTokenSource? _settingsDebounce;
+    private CameraResolution _cameraResolution = new(640, 480);
+    private CameraResolution? _hostResolution;
+    private MemoryMappedFile? _mmf;
+    private MemoryMappedViewAccessor? _mmfAccessor;
+    private ulong _frameSequence;
+    private readonly byte[] _pixelBufferA = new byte[Shared.MaxFrameWidth * Shared.MaxFrameHeight * 4];
+    private readonly byte[] _pixelBufferB = new byte[Shared.MaxFrameWidth * Shared.MaxFrameHeight * 4];
+    private bool _useBufferA = true;
+    private RenderTargetBitmap? _renderBitmap;
+    private CameraResolution? _renderBitmapResolution;
+    private WriteableBitmap? _writeableBitmap;
+    private volatile bool _uiPending;
+    private string? _latestStatsText;
+    private volatile bool _reconnectNeeded;
+    private bool _mirrorVideo;
+    private bool _torchActive;
+    private bool _hasTorch;
+    private System.Net.Sockets.UdpClient? _discoveryClient;
+    private CancellationTokenSource? _discoveryCts;
+    private string? _discoveredAddress;
+    private int _statsFrameCount;
+    private long _statsByteCount;
+    private long _statsWindowStartTicks = Stopwatch.GetTimestamp();
+
+    private sealed record CameraOption(string Id, string Label);
+    private sealed record SizeOption(int Width, int Height, string Label);
+    private sealed record FpsOption(int Min, int Max, string Label);
+    private sealed record CameraResolution(int Width, int Height);
+
+    public MainWindow()
+    {
+        InitializeComponent();
+        InitializeSharedMemory();
+        StartDiscoveryListener();
+        if (CameraSourceRegistered()) CameraDeviceText.Text = "Connect to your phone to start the Windows camera.";
+        else
+        {
+            CameraDeviceText.Text = "Install the Windows camera to use Phonecam in apps.";
+            InstallCameraButton.Visibility = Visibility.Visible;
+        }
+        try
+        {
+            _listener.Start();
+            _ = ServeOutputAsync();
+        }
+        catch (System.Net.Sockets.SocketException)
+        {
+            SetStatus("Output port unavailable", false);
+        }
+        Loaded += MainWindow_Loaded;
+    }
+
+    private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("PHONECAM_AUTO_CONNECT"), "1", StringComparison.OrdinalIgnoreCase))
+        {
+            Dispatcher.InvokeAsync(async () =>
+            {
+                await Task.Delay(300);
+                Connect_Click(this, new RoutedEventArgs());
+            });
+        }
+
+        var capturePath = Environment.GetEnvironmentVariable("PHONECAM_CAPTURE_PATH");
+        if (!string.IsNullOrEmpty(capturePath))
+        {
+            Dispatcher.InvokeAsync(async () =>
+            {
+                var delayMs = string.Equals(Environment.GetEnvironmentVariable("PHONECAM_AUTO_CONNECT"), "1", StringComparison.OrdinalIgnoreCase) ? 12000 : 1000;
+                await Task.Delay(delayMs);
+                try
+                {
+                    var width = (int)ActualWidth;
+                    var height = (int)ActualHeight;
+                    if (width <= 0) width = 1050;
+                    if (height <= 0) height = 860;
+                    var rtb = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
+                    rtb.Render(this);
+                    var encoder = new PngBitmapEncoder();
+                    encoder.Frames.Add(BitmapFrame.Create(rtb));
+                    using var stream = File.Create(capturePath);
+                    encoder.Save(stream);
+                    Debug.WriteLine($"Saved window screenshot to {capturePath}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Failed to capture window screenshot: {ex.Message}");
+                }
+            });
+        }
+    }
+
+    private void InitializeSharedMemory()
+    {
+        try
+        {
+            _mmf = MemoryMappedFile.CreateOrOpen(Shared.SharedMemoryName, Shared.MaxBufferSize, MemoryMappedFileAccess.ReadWrite);
+            _mmfAccessor = _mmf.CreateViewAccessor(0, Shared.MaxBufferSize, MemoryMappedFileAccess.Write);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Failed to initialize shared memory: {ex.Message}");
+        }
+    }
+
+    private unsafe void WriteSharedFrame(int width, int height, byte[] pixels, ulong sequence)
+    {
+        if (_mmfAccessor is null) return;
+        byte* ptr = null;
+        try
+        {
+            _mmfAccessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+            if (ptr != null)
+            {
+                *(uint*)(ptr + 0) = Shared.SharedMemoryMagic;
+                *(uint*)(ptr + 4) = (uint)width;
+                *(uint*)(ptr + 8) = (uint)height;
+                *(uint*)(ptr + 12) = (uint)(width * 4);
+                *(ulong*)(ptr + 16) = sequence;
+                *(long*)(ptr + 24) = Stopwatch.GetTimestamp();
+                var pixelLength = Math.Min(pixels.Length, width * height * 4);
+                fixed (byte* pPixels = pixels)
+                {
+                    Buffer.MemoryCopy(pPixels, ptr + Shared.HeaderSize, Shared.MaxBufferSize - Shared.HeaderSize, pixelLength);
+                }
+            }
+        }
+        finally
+        {
+            if (ptr != null) _mmfAccessor.SafeMemoryMappedViewHandle.ReleasePointer();
+        }
+    }
+
+    private async Task ServeOutputAsync()
+    {
+        while (true)
+        {
+            System.Net.Sockets.TcpClient client;
+            try { client = await _listener.AcceptTcpClientAsync(); }
+            catch (System.Net.Sockets.SocketException) { break; }
+            catch (ObjectDisposedException) { break; }
+            _ = HandleClientAsync(client);
+        }
+    }
+
+    private async Task HandleClientAsync(System.Net.Sockets.TcpClient client)
+    {
+        using (client)
+        {
+            try
+            {
+                var stream = client.GetStream();
+                using var reader = new StreamReader(stream, Encoding.ASCII, false, 1024, true);
+                var request = await reader.ReadLineAsync();
+                while (!string.IsNullOrEmpty(await reader.ReadLineAsync())) { }
+                var path = request?.Split(' ', StringSplitOptions.RemoveEmptyEntries).ElementAtOrDefault(1);
+                if (string.Equals(path, "/camera/mode", StringComparison.OrdinalIgnoreCase))
+                {
+                    var resolution = Volatile.Read(ref _cameraResolution);
+                    var bytes = Encoding.ASCII.GetBytes($"{{\"width\":{resolution.Width},\"height\":{resolution.Height}}}");
+                    var header = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n");
+                    await stream.WriteAsync(header);
+                    await stream.WriteAsync(bytes);
+                }
+                else if (string.Equals(path, "/camera/frame", StringComparison.OrdinalIgnoreCase))
+                {
+                    var pixels = Volatile.Read(ref _latestCameraFrame);
+                    var resolution = Volatile.Read(ref _cameraResolution);
+                    var length = resolution.Width * resolution.Height * 4;
+                    var status = pixels is null ? "503 Service Unavailable" : "200 OK";
+                    var header = Encoding.ASCII.GetBytes($"HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {(pixels is not null ? length : 0)}\r\nConnection: close\r\n\r\n");
+                    await stream.WriteAsync(header);
+                    if (pixels is not null) await stream.WriteAsync(pixels.AsMemory(0, length));
+                }
+                else
+                {
+                    var streamUrl = AddressBox.Dispatcher.Invoke(() => AddressBox.Text.Trim());
+                    var safeUrl = WebUtility.HtmlEncode(streamUrl);
+                    var html = $$"""
+                        <!doctype html>
+                        <meta charset="utf-8">
+                        <meta name="viewport" content="width=device-width,initial-scale=1">
+                        <title>Phonecam output</title>
+                        <style>
+                          *{box-sizing:border-box}body{margin:0;background:#10151d;color:#e8edf5;font:15px system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}
+                          main{width:min(100vw,1280px);padding:20px}header{display:flex;align-items:center;gap:10px;margin-bottom:14px;color:#95a3b8}i{width:9px;height:9px;border-radius:50%;background:#70e1c1;display:inline-block}
+                          img{display:block;width:100%;max-height:calc(100vh - 95px);object-fit:contain;background:#080b10;border-radius:14px}
+                        </style>
+                        <main><header><i></i>Phonecam - live camera</header><img src="{{safeUrl}}" alt="Phone camera"></main>
+                        """;
+                    var bytes = Encoding.UTF8.GetBytes(html);
+                    var header = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n");
+                    await stream.WriteAsync(header);
+                    await stream.WriteAsync(bytes);
+                }
+            }
+            catch (IOException) { }
+            catch (Exception) { }
+        }
+    }
+
+    private bool _isConnectingOrStreaming;
+
+    private async void Connect_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isConnectingOrStreaming)
+        {
+            _streamCancellation?.Cancel();
+            _isConnectingOrStreaming = false;
+            ConnectButton.Content = "Connect camera";
+            SetStatus("Disconnected", false);
+            EmptyState.Visibility = Visibility.Visible;
+            return;
+        }
+
+        if (!Uri.TryCreate(AddressBox.Text.Trim(), UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+        {
+            SetStatus("Enter a valid http or https address", false);
+            return;
+        }
+
+        _streamCancellation?.Cancel();
+        _streamCancellation = new CancellationTokenSource();
+        var cancellationToken = _streamCancellation.Token;
+
+        _isConnectingOrStreaming = true;
+        ConnectButton.Content = "Disconnect";
+        EmptyState.Visibility = Visibility.Collapsed;
+
+        _ = ConnectLoopAsync(uri, cancellationToken);
+    }
+
+    private async Task ConnectLoopAsync(Uri uri, CancellationToken cancellationToken)
+    {
+        var retryDelay = TimeSpan.FromSeconds(1);
+        var maxRetryDelay = TimeSpan.FromSeconds(6);
+
+        while (!cancellationToken.IsCancellationRequested && _isConnectingOrStreaming)
+        {
+            var headersReceived = false;
+            try
+            {
+                SetStatus("Connecting...", false);
+                if ((uri.Host == "127.0.0.1" || uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) && uri.Port == 18765)
+                {
+                    SetStatus("Setting up USB connection...", false);
+                    await EnsureUsbForwardAsync(cancellationToken);
+                }
+
+                _settingsUri = SettingsUri(uri);
+                await LoadPhoneSettingsAsync(cancellationToken);
+                await StartVirtualCameraAsync();
+
+                var isUsb = (uri.Host == "127.0.0.1" || uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) && uri.Port == 18765;
+                var ffmpegPath = FindFfmpeg();
+                HttpResponseMessage? response = null;
+                var isH264 = false;
+                var streamRotation = 0;
+
+                if (!string.IsNullOrEmpty(ffmpegPath))
+                {
+                    try
+                    {
+                        var h264Uri = new UriBuilder(uri) { Path = "/stream.h264", Query = "", Fragment = "" }.Uri;
+                        using var h264Timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        h264Timeout.CancelAfter(TimeSpan.FromSeconds(3));
+                        var testResp = await _http.GetAsync(h264Uri, HttpCompletionOption.ResponseHeadersRead, h264Timeout.Token);
+                        if (testResp.IsSuccessStatusCode && testResp.Content.Headers.ContentType?.MediaType?.Contains("h264", StringComparison.OrdinalIgnoreCase) == true)
+                        {
+                            response = testResp;
+                            isH264 = true;
+                            if (response.Headers.TryGetValues("X-Rotation", out var rotVals) && int.TryParse(rotVals.FirstOrDefault(), out var r)) streamRotation = r;
+                            if (response.Headers.TryGetValues("X-Width", out var wVals) && int.TryParse(wVals.FirstOrDefault(), out var w) &&
+                                response.Headers.TryGetValues("X-Height", out var hVals) && int.TryParse(hVals.FirstOrDefault(), out var h))
+                            {
+                                Volatile.Write(ref _cameraResolution, new CameraResolution(w, h));
+                            }
+                        }
+                        else
+                        {
+                            testResp.Dispose();
+                        }
+                    }
+                    catch { }
+                }
+
+                if (response == null)
+                {
+                    using var headerTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    headerTimeout.CancelAfter(TimeSpan.FromSeconds(8));
+                    response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, headerTimeout.Token);
+                    response.EnsureSuccessStatusCode();
+                }
+
+                headersReceived = true;
+                SetStatus("Connected", true, isUsb ? (isH264 ? "USB (H.264 HW)" : "USB") : (isH264 ? "Wi-Fi (H.264 HW)" : "Wi-Fi"));
+                retryDelay = TimeSpan.FromSeconds(1); // Reset backoff on successful connection
+
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                if (isH264 && !string.IsNullOrEmpty(ffmpegPath))
+                {
+                    await ReadH264Async(stream, cancellationToken, ffmpegPath, streamRotation, isUsb);
+                }
+                else
+                {
+                    await ReadMultipartAsync(stream, cancellationToken);
+                }
+
+                if (cancellationToken.IsCancellationRequested || !_isConnectingOrStreaming) break;
+                SetStatus("Phone closed the camera stream", false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || !_isConnectingOrStreaming)
+            {
+                break;
+            }
+            catch (OperationCanceledException)
+            {
+                SetStatus(headersReceived ? "Camera feed stalled" : "Phone not reachable", false);
+            }
+            catch (HttpRequestException)
+            {
+                SetStatus("Phone not reachable", false);
+            }
+            catch (Exception error)
+            {
+                SetStatus($"Stream error: {error.Message}", false);
+            }
+
+            var autoReconnect = await Dispatcher.InvokeAsync(() => AutoReconnectBox.IsChecked == true);
+            if (!autoReconnect || cancellationToken.IsCancellationRequested || !_isConnectingOrStreaming)
+            {
+                break;
+            }
+
+            await Dispatcher.InvokeAsync(() => EmptyState.Visibility = Visibility.Visible);
+            SetStatus($"Reconnecting in {retryDelay.TotalSeconds:0}s...", false);
+
+            try
+            {
+                await Task.Delay(retryDelay, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            retryDelay = TimeSpan.FromSeconds(Math.Min(maxRetryDelay.TotalSeconds, retryDelay.TotalSeconds * 1.5));
+        }
+
+        await Dispatcher.InvokeAsync(() =>
+        {
+            _isConnectingOrStreaming = false;
+            ConnectButton.Content = "Connect camera";
+            EmptyState.Visibility = Visibility.Visible;
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                SetStatus("Disconnected", false);
+            }
+        });
+    }
+
+    private static Uri SettingsUri(Uri streamUri) => new UriBuilder(streamUri) { Path = "/settings", Query = "", Fragment = "" }.Uri;
+
+    private async Task LoadPhoneSettingsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            var json = await _http.GetStringAsync(_settingsUri, timeout.Token);
+            await Dispatcher.InvokeAsync(() => ApplyPhoneSettingsJson(json));
+        }
+        catch (Exception error) when (error is HttpRequestException or OperationCanceledException or JsonException)
+        {
+            await Dispatcher.InvokeAsync(() =>
+            {
+                SetSettingsEnabled(false);
+                SettingsStatusText.Text = "Phone settings are unavailable - update the Phonecam app on your phone.";
+            });
+        }
+    }
+
+    private void ApplyPhoneSettingsJson(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        var cameras = root.GetProperty("cameras").EnumerateArray().Select(item => new CameraOption(item.GetProperty("id").GetString() ?? "", item.GetProperty("label").GetString() ?? "Camera")).ToArray();
+        var sizes = root.GetProperty("sizes").EnumerateArray().Select(item => new SizeOption(item.GetProperty("width").GetInt32(), item.GetProperty("height").GetInt32(), item.GetProperty("label").GetString() ?? "Resolution")).ToArray();
+        var fps = root.GetProperty("fpsRanges").EnumerateArray().Select(item => new FpsOption(item.GetProperty("min").GetInt32(), item.GetProperty("max").GetInt32(), item.GetProperty("label").GetString() ?? "Frame rate")).ToArray();
+        Volatile.Write(ref _cameraResolution, new CameraResolution(root.GetProperty("width").GetInt32(), root.GetProperty("height").GetInt32()));
+        _updatingPhoneSettings = true;
+        CameraSettingsBox.ItemsSource = cameras;
+        ResolutionSettingsBox.ItemsSource = sizes;
+        FrameRateSettingsBox.ItemsSource = fps;
+        CameraSettingsBox.SelectedItem = cameras.FirstOrDefault(option => option.Id == root.GetProperty("cameraId").GetString());
+        ResolutionSettingsBox.SelectedItem = sizes.FirstOrDefault(option => option.Width == root.GetProperty("width").GetInt32() && option.Height == root.GetProperty("height").GetInt32());
+        FrameRateSettingsBox.SelectedItem = fps.FirstOrDefault(option => option.Min == root.GetProperty("fpsMin").GetInt32() && option.Max == root.GetProperty("fpsMax").GetInt32());
+        var quality = root.GetProperty("quality").GetInt32();
+        QualitySettingsBox.SelectedItem = QualitySettingsBox.Items.OfType<System.Windows.Controls.ComboBoxItem>().FirstOrDefault(item => (string?)item.Tag == quality.ToString());
+
+        _hasTorch = root.TryGetProperty("hasTorch", out var hasTorchProp) && hasTorchProp.GetBoolean();
+        _torchActive = root.TryGetProperty("torch", out var torchProp) && torchProp.GetBoolean();
+        TorchButton.IsEnabled = _hasTorch;
+        TorchButton.Content = _torchActive ? "Torch: ON" : "Torch: OFF";
+
+        _updatingPhoneSettings = false;
+        SetSettingsEnabled(cameras.Length > 0 && sizes.Length > 0 && fps.Length > 0);
+        SettingsStatusText.Text = "Settings apply to the live phone camera.";
+    }
+
+    private void SetSettingsEnabled(bool enabled)
+    {
+        CameraSettingsBox.IsEnabled = enabled;
+        ResolutionSettingsBox.IsEnabled = enabled;
+        FrameRateSettingsBox.IsEnabled = enabled;
+        QualitySettingsBox.IsEnabled = enabled;
+        TorchButton.IsEnabled = enabled && _hasTorch;
+    }
+
+    private async void CameraSettings_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_updatingPhoneSettings || _settingsUri is null || CameraSettingsBox.SelectedItem is not CameraOption camera || ResolutionSettingsBox.SelectedItem is not SizeOption size || FrameRateSettingsBox.SelectedItem is not FpsOption fps || QualitySettingsBox.SelectedItem is not System.Windows.Controls.ComboBoxItem qualityItem || !int.TryParse((string?)qualityItem.Tag, out var quality)) return;
+        _settingsDebounce?.Cancel();
+        _settingsDebounce?.Dispose();
+        _settingsDebounce = new CancellationTokenSource();
+        var token = _settingsDebounce.Token;
+        try
+        {
+            await Task.Delay(180, token);
+            await _settingsUpdate.WaitAsync(token);
+            try
+            {
+                var payload = JsonSerializer.Serialize(new { cameraId = camera.Id, width = size.Width, height = size.Height, fpsMin = fps.Min, fpsMax = fps.Max, quality, torch = _torchActive });
+                using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                timeout.CancelAfter(TimeSpan.FromSeconds(5));
+                var previousResolution = Volatile.Read(ref _cameraResolution);
+                using var response = await _http.PostAsync(_settingsUri, content, timeout.Token);
+                response.EnsureSuccessStatusCode();
+                var json = await response.Content.ReadAsStringAsync(timeout.Token);
+                await Dispatcher.InvokeAsync(() => ApplyPhoneSettingsJson(json));
+                var currentResolution = Volatile.Read(ref _cameraResolution);
+                _reconnectNeeded = true;
+                if (previousResolution != currentResolution && _cameraHost is { HasExited: false })
+                {
+                    await Dispatcher.InvokeAsync(() => SettingsStatusText.Text = "Updating Windows camera resolution...");
+                    await StartVirtualCameraAsync();
+                    await Dispatcher.InvokeAsync(() => SettingsStatusText.Text = "Resolution updated. Reopen the camera in your video app.");
+                }
+            }
+            finally { _settingsUpdate.Release(); }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error) when (error is HttpRequestException or JsonException or TaskCanceledException)
+        {
+            SettingsStatusText.Text = "Could not apply settings - check that the phone is still connected.";
+        }
+    }
+
+    private async void TorchButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_settingsUri is null || !_hasTorch) return;
+        TorchButton.IsEnabled = false;
+        try
+        {
+            var targetTorch = !_torchActive;
+            var payload = JsonSerializer.Serialize(new { torch = targetTorch });
+            using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+            using var response = await _http.PostAsync(_settingsUri, content, timeout.Token);
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync(timeout.Token);
+            ApplyPhoneSettingsJson(json);
+        }
+        catch (Exception ex)
+        {
+            SettingsStatusText.Text = $"Torch error: {ex.Message}";
+        }
+        finally
+        {
+            TorchButton.IsEnabled = _hasTorch;
+        }
+    }
+
+    private void MirrorBox_Click(object sender, RoutedEventArgs e)
+    {
+        _mirrorVideo = MirrorBox.IsChecked == true;
+        _reconnectNeeded = true;
+    }
+
+    private async void AutoDetectUsb_Click(object sender, RoutedEventArgs e)
+    {
+        AutoDetectUsbButton.IsEnabled = false;
+        SetStatus("Scanning for USB phone...", false);
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var devicesOutput = await RunAdbAsync(cts.Token, "devices");
+            var lines = devicesOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+            var deviceFound = false;
+            foreach (var line in lines)
+            {
+                if (line.StartsWith("List of devices", StringComparison.OrdinalIgnoreCase)) continue;
+                var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 2 && parts[1].Equals("device", StringComparison.OrdinalIgnoreCase))
+                {
+                    deviceFound = true;
+                    break;
+                }
+            }
+
+            if (!deviceFound)
+            {
+                SetStatus("No authorized Android phone detected. Enable USB debugging.", false);
+                return;
+            }
+
+            AddressBox.Text = "http://127.0.0.1:18765/stream.mjpg";
+            Connect_Click(sender, e);
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"ADB error: {ex.Message}", false);
+        }
+        finally
+        {
+            AutoDetectUsbButton.IsEnabled = true;
+        }
+    }
+
+    private static async Task EnsureUsbForwardAsync(CancellationToken cancellationToken)
+    {
+        var forwards = await RunAdbAsync(cancellationToken, "forward", "--list");
+        foreach (var line in forwards.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            var columns = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (columns.Length < 3 || columns[^2] != "tcp:18765") continue;
+            if (columns[^1] == "tcp:8765") return;
+            throw new InvalidOperationException($"USB port 18765 is already forwarded to {columns[^1]}. Remove that ADB forward, then reconnect.");
+        }
+
+        await RunAdbAsync(cancellationToken, "forward", "--no-rebind", "tcp:18765", "tcp:8765");
+    }
+
+    private static async Task<string> RunAdbAsync(CancellationToken cancellationToken, params string[] arguments)
+    {
+        var start = new ProcessStartInfo("adb")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
+
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start adb. Install Android Platform Tools and add adb to PATH.");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(15));
+        var outputTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        var errorTask = process.StandardError.ReadToEndAsync(timeout.Token);
+        try { await process.WaitForExitAsync(timeout.Token); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new InvalidOperationException("adb did not respond within 15 seconds. Check the USB debugging prompt on the phone.");
+        }
+
+        var output = await outputTask;
+        var error = await errorTask;
+        var result = (output + Environment.NewLine + error).Trim();
+        if (process.ExitCode != 0) throw new InvalidOperationException(string.IsNullOrWhiteSpace(result) ? "adb failed to configure USB forwarding." : result);
+        return result;
+    }
+
+    private static bool CameraSourceRegistered()
+    {
+        using var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Classes\CLSID\{f15889e2-7b53-4ee1-bad4-9e7c51a94d60}\InprocServer32");
+        return key is not null;
+    }
+
+    private async Task StartVirtualCameraAsync()
+    {
+        try
+        {
+            var resolution = Volatile.Read(ref _cameraResolution);
+            if (_cameraHost is { HasExited: false } && _hostResolution == resolution) return;
+            if (_cameraHost is { HasExited: false })
+            {
+                var previousHost = _cameraHost;
+                try { previousHost.StandardInput.Close(); } catch { }
+                try { await previousHost.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(3)); }
+                catch (TimeoutException) { try { previousHost.Kill(true); } catch { } }
+                previousHost.Dispose();
+                _cameraHost = null;
+                await Task.Delay(300);
+            }
+            var path = Path.Combine(AppContext.BaseDirectory, "PhonecamCameraHost.exe");
+            if (!File.Exists(path)) throw new FileNotFoundException("Phonecam camera host is missing.", path);
+            var start = new ProcessStartInfo(path)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            _cameraHost = Process.Start(start) ?? throw new InvalidOperationException("Could not start the Phonecam camera host.");
+            var ready = await _cameraHost.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(12));
+            if (ready != "READY")
+            {
+                var error = await _cameraHost.StandardError.ReadToEndAsync();
+                throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "Windows did not start the Phonecam virtual camera." : error.Trim());
+            }
+            _hostResolution = resolution;
+            CameraDeviceText.Text = "Ready - select Phonecam (Windows Virtual Camera) in your app.";
+            InstallCameraButton.Visibility = Visibility.Collapsed;
+        }
+        catch (Exception error)
+        {
+            CameraDeviceText.Text = $"Windows webcam unavailable - {error.Message}";
+            InstallCameraButton.Visibility = Visibility.Visible;
+        }
+    }
+
+    private async void InstallCamera_Click(object sender, RoutedEventArgs e)
+    {
+        InstallCameraButton.IsEnabled = false;
+        CameraDeviceText.Text = "Installing the Windows camera...";
+        try
+        {
+            var script = Path.Combine(AppContext.BaseDirectory, "install-camera.ps1");
+            if (!File.Exists(script)) throw new FileNotFoundException("The Phonecam camera installer is missing.", script);
+            var install = Process.Start(new ProcessStartInfo("powershell.exe")
+            {
+                UseShellExecute = true,
+                Verb = "runas",
+                WindowStyle = ProcessWindowStyle.Hidden,
+                Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{script}\""
+            }) ?? throw new InvalidOperationException("Could not launch the camera installer.");
+            await install.WaitForExitAsync();
+            if (install.ExitCode != 0) throw new InvalidOperationException("Camera installation failed. Run install-camera.ps1 as administrator.");
+            if (_settingsUri is not null) await StartVirtualCameraAsync();
+            else
+            {
+                CameraDeviceText.Text = "Camera installed - connect to a phone to start it.";
+                InstallCameraButton.Visibility = Visibility.Collapsed;
+            }
+        }
+        catch (Exception error)
+        {
+            CameraDeviceText.Text = $"Camera installation stopped - {error.Message}";
+        }
+        finally { InstallCameraButton.IsEnabled = true; }
+    }
+
+    private static string? FindFfmpeg()
+    {
+        var local = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
+        if (File.Exists(local)) return local;
+        var relativeArtifacts = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "artifacts", "windows", "ffmpeg.exe"));
+        if (File.Exists(relativeArtifacts)) return relativeArtifacts;
+        return null;
+    }
+
+    private async Task ReadH264Async(Stream networkStream, CancellationToken cancellationToken, string ffmpegPath, int rotationDegrees, bool isUsb)
+    {
+        var resolution = Volatile.Read(ref _cameraResolution);
+        var targetW = resolution.Width;
+        var targetH = resolution.Height;
+        var frameBytes = targetW * targetH * 4;
+
+        var filter = "";
+        if (rotationDegrees == 90) filter = "transpose=clock";
+        else if (rotationDegrees == 180) filter = "hflip,vflip";
+        else if (rotationDegrees == 270) filter = "transpose=cclock";
+
+        if (_mirrorVideo) filter += (filter.Length > 0 ? ",hflip" : "hflip");
+
+        if (filter.Length > 0)
+        {
+            filter += $",scale={targetW}:{targetH}:force_original_aspect_ratio=decrease,pad={targetW}:{targetH}:(ow-iw)/2:(oh-ih)/2";
+        }
+
+        var startInfo = new ProcessStartInfo(ffmpegPath)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        startInfo.ArgumentList.Add("-hide_banner");
+        startInfo.ArgumentList.Add("-nostats");
+        startInfo.ArgumentList.Add("-loglevel");
+        startInfo.ArgumentList.Add("error");
+        startInfo.ArgumentList.Add("-hwaccel");
+        startInfo.ArgumentList.Add("auto");
+        startInfo.ArgumentList.Add("-fflags");
+        startInfo.ArgumentList.Add("nobuffer");
+        startInfo.ArgumentList.Add("-flags");
+        startInfo.ArgumentList.Add("low_delay");
+        startInfo.ArgumentList.Add("-probesize");
+        startInfo.ArgumentList.Add("131072");
+        startInfo.ArgumentList.Add("-f");
+        startInfo.ArgumentList.Add("h264");
+        startInfo.ArgumentList.Add("-i");
+        startInfo.ArgumentList.Add("pipe:0");
+        if (filter.Length > 0)
+        {
+            startInfo.ArgumentList.Add("-vf");
+            startInfo.ArgumentList.Add(filter);
+        }
+        startInfo.ArgumentList.Add("-pix_fmt");
+        startInfo.ArgumentList.Add("bgra");
+        startInfo.ArgumentList.Add("-f");
+        startInfo.ArgumentList.Add("rawvideo");
+        startInfo.ArgumentList.Add("pipe:1");
+
+        using var ffmpeg = Process.Start(startInfo) ?? throw new InvalidOperationException("Failed to launch ffmpeg hardware decoder.");
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        // Continuously drain stderr in background so ffmpeg never blocks on full pipe buffer
+        var errorTask = Task.Run(async () =>
+        {
+            try
+            {
+                var errBuffer = new char[1024];
+                while (!linkedCts.Token.IsCancellationRequested)
+                {
+                    var read = await ffmpeg.StandardError.ReadAsync(errBuffer.AsMemory(0, errBuffer.Length), linkedCts.Token);
+                    if (read <= 0) break;
+                }
+            }
+            catch { }
+        }, linkedCts.Token);
+
+        var feedTask = Task.Run(async () =>
+        {
+            var buffer = new byte[65536];
+            try
+            {
+                while (!linkedCts.Token.IsCancellationRequested)
+                {
+                    var read = await networkStream.ReadAsync(buffer.AsMemory(0, buffer.Length), linkedCts.Token);
+                    if (read <= 0) break;
+                    await ffmpeg.StandardInput.BaseStream.WriteAsync(buffer.AsMemory(0, read), linkedCts.Token);
+                    await ffmpeg.StandardInput.BaseStream.FlushAsync(linkedCts.Token);
+                    _statsByteCount += read;
+                }
+            }
+            catch { }
+            finally
+            {
+                try { ffmpeg.StandardInput.Close(); } catch { }
+            }
+        }, linkedCts.Token);
+
+        try
+        {
+            var frameBuffer = new byte[frameBytes];
+            var stdout = ffmpeg.StandardOutput.BaseStream;
+
+            _statsFrameCount = 0;
+            _statsByteCount = 0;
+            _statsWindowStartTicks = Stopwatch.GetTimestamp();
+            var isCalibrated = false;
+
+            while (!linkedCts.Token.IsCancellationRequested)
+            {
+                var offset = 0;
+                while (offset < frameBytes)
+                {
+                    var read = await stdout.ReadAsync(frameBuffer.AsMemory(offset, frameBytes - offset), linkedCts.Token);
+                    if (read <= 0) throw new EndOfStreamException("FFmpeg decoder output ended.");
+                    offset += read;
+                }
+
+                if (_reconnectNeeded)
+                {
+                    _reconnectNeeded = false;
+                    break;
+                }
+
+                var targetBuffer = _useBufferA ? _pixelBufferA : _pixelBufferB;
+                Buffer.BlockCopy(frameBuffer, 0, targetBuffer, 0, frameBytes);
+                Volatile.Write(ref _latestCameraFrame, targetBuffer);
+                WriteSharedFrame(targetW, targetH, targetBuffer, ++_frameSequence);
+                _useBufferA = !_useBufferA;
+
+                var nowTicks = Stopwatch.GetTimestamp();
+                if (!isCalibrated)
+                {
+                    isCalibrated = true;
+                    _statsFrameCount = 0;
+                    _statsByteCount = 0;
+                    _statsWindowStartTicks = nowTicks;
+                    _latestStatsText = "30.0 FPS  •  H.264 HW";
+                }
+                else
+                {
+                    _statsFrameCount++;
+                    var elapsedSec = (double)(nowTicks - _statsWindowStartTicks) / Stopwatch.Frequency;
+                    if (elapsedSec >= 0.5)
+                    {
+                        var fps = _statsFrameCount / elapsedSec;
+                        var mbps = (_statsByteCount * 8.0) / (elapsedSec * 1_000_000.0);
+                        _latestStatsText = $"{fps:0.0} FPS  •  {mbps:0.0} Mbps (H.264 HW)";
+                        _statsFrameCount = 0;
+                        _statsByteCount = 0;
+                        _statsWindowStartTicks = nowTicks;
+                    }
+                }
+
+                if (!_uiPending)
+                {
+                    _uiPending = true;
+                    _ = Dispatcher.InvokeAsync(() =>
+                    {
+                        try
+                        {
+                            if (_writeableBitmap is null || _writeableBitmap.PixelWidth != targetW || _writeableBitmap.PixelHeight != targetH)
+                            {
+                                _writeableBitmap = new WriteableBitmap(targetW, targetH, 96, 96, PixelFormats.Bgra32, null);
+                                Preview.Source = _writeableBitmap;
+                            }
+                            _writeableBitmap.WritePixels(new Int32Rect(0, 0, targetW, targetH), targetBuffer, targetW * 4, 0);
+                            ResolutionText.Text = $"{targetW} x {targetH}";
+                            if (_latestStatsText != null)
+                            {
+                                StatsText.Text = _latestStatsText;
+                            }
+                            EmptyState.Visibility = Visibility.Collapsed;
+                            StatusDot.Fill = (Brush)FindResource("Accent");
+                        }
+                        finally
+                        {
+                            _uiPending = false;
+                        }
+                    });
+                }
+            }
+        }
+        finally
+        {
+            linkedCts.Cancel();
+            try { ffmpeg.StandardInput.Close(); } catch { }
+            try { if (!ffmpeg.HasExited) ffmpeg.Kill(true); } catch { }
+            try { await feedTask; } catch { }
+            try { await errorTask; } catch { }
+        }
+    }
+
+    private async Task ReadMultipartAsync(Stream networkStream, CancellationToken cancellationToken)
+    {
+        // Wrap network stream in a 64KB buffer to eliminate single-byte/small read syscall overhead
+        using var bufferedStream = new BufferedStream(networkStream, 65536);
+        var lineBuffer = new byte[512];
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var line = await ReadLineBufferedAsync(bufferedStream, lineBuffer, cancellationToken);
+            if (line is null) break;
+            if (line.Length == 0 || line.StartsWith("--", StringComparison.Ordinal)) continue;
+            long length = 0;
+            int rotationDegrees = 0;
+            while (!string.IsNullOrEmpty(line = await ReadLineBufferedAsync(bufferedStream, lineBuffer, cancellationToken) ?? ""))
+            {
+                if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                {
+                    long.TryParse(line.AsSpan(15).Trim(), out length);
+                }
+                else if (line.StartsWith("X-Rotation:", StringComparison.OrdinalIgnoreCase))
+                {
+                    int.TryParse(line.AsSpan(11).Trim(), out rotationDegrees);
+                }
+            }
+            if (length is <= 0 or > 10_000_000) continue;
+
+            var bytes = new byte[(int)length];
+            using (var frameTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            {
+                frameTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+                await bufferedStream.ReadExactlyAsync(bytes, frameTimeout.Token);
+            }
+            var bitmap = new BitmapImage();
+            using (var input = new MemoryStream(bytes))
+            {
+                bitmap.BeginInit();
+                bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                bitmap.StreamSource = input;
+                bitmap.EndInit();
+                bitmap.Freeze();
+                var resolution = Volatile.Read(ref _cameraResolution);
+                var isRotated = (rotationDegrees == 90 || rotationDegrees == 270);
+                var orientedWidth = isRotated ? bitmap.PixelHeight : bitmap.PixelWidth;
+                var orientedHeight = isRotated ? bitmap.PixelWidth : bitmap.PixelHeight;
+                var scale = Math.Max((double)resolution.Width / orientedWidth, (double)resolution.Height / orientedHeight);
+                var frameWidth = orientedWidth * scale;
+                var frameHeight = orientedHeight * scale;
+                var visual = new DrawingVisual();
+                using (var drawing = visual.RenderOpen())
+                {
+                    var group = new TransformGroup();
+                    if (rotationDegrees != 0)
+                    {
+                        group.Children.Add(new RotateTransform(rotationDegrees, resolution.Width / 2.0, resolution.Height / 2.0));
+                    }
+                    if (_mirrorVideo)
+                    {
+                        group.Children.Add(new ScaleTransform(-1, 1, resolution.Width / 2.0, resolution.Height / 2.0));
+                    }
+                    if (group.Children.Count > 0)
+                    {
+                        drawing.PushTransform(group);
+                    }
+                    var drawW = isRotated ? frameHeight : frameWidth;
+                    var drawH = isRotated ? frameWidth : frameHeight;
+                    drawing.DrawImage(bitmap, new Rect((resolution.Width - drawW) / 2, (resolution.Height - drawH) / 2, drawW, drawH));
+                    if (group.Children.Count > 0)
+                    {
+                        drawing.Pop();
+                    }
+                }
+
+                if (_renderBitmap is null || _renderBitmapResolution != resolution)
+                {
+                    _renderBitmap = new RenderTargetBitmap(resolution.Width, resolution.Height, 96, 96, PixelFormats.Pbgra32);
+                    _renderBitmapResolution = resolution;
+                }
+                _renderBitmap.Clear();
+                _renderBitmap.Render(visual);
+
+                var targetBuffer = _useBufferA ? _pixelBufferA : _pixelBufferB;
+                _renderBitmap.CopyPixels(new Int32Rect(0, 0, resolution.Width, resolution.Height), targetBuffer, resolution.Width * 4, 0);
+                Volatile.Write(ref _latestCameraFrame, targetBuffer);
+                WriteSharedFrame(resolution.Width, resolution.Height, targetBuffer, ++_frameSequence);
+                _useBufferA = !_useBufferA;
+            }
+
+            _statsFrameCount++;
+            _statsByteCount += bytes.Length;
+            var nowTicks = Stopwatch.GetTimestamp();
+            var elapsedSec = (double)(nowTicks - _statsWindowStartTicks) / Stopwatch.Frequency;
+            string? statsDisplay = null;
+            if (elapsedSec >= 0.8)
+            {
+                var fps = _statsFrameCount / elapsedSec;
+                var mbps = (_statsByteCount * 8.0) / (elapsedSec * 1_000_000.0);
+                statsDisplay = $"{fps:0.0} FPS  •  {mbps:0.0} Mbps";
+                _statsFrameCount = 0;
+                _statsByteCount = 0;
+                _statsWindowStartTicks = nowTicks;
+            }
+
+            await Dispatcher.InvokeAsync(() =>
+            {
+                Preview.Source = bitmap;
+                ResolutionText.Text = $"{bitmap.PixelWidth} x {bitmap.PixelHeight}";
+                if (statsDisplay != null)
+                {
+                    StatsText.Text = statsDisplay;
+                }
+                EmptyState.Visibility = Visibility.Collapsed;
+                StatusDot.Fill = (Brush)FindResource("Accent");
+            });
+        }
+    }
+
+    private static async Task<string?> ReadLineBufferedAsync(BufferedStream stream, byte[] buffer, CancellationToken cancellationToken)
+    {
+        var count = 0;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(10));
+        while (count < buffer.Length)
+        {
+            var single = new byte[1];
+            var read = await stream.ReadAsync(single.AsMemory(0, 1), cts.Token);
+            if (read == 0) return count == 0 ? null : Encoding.ASCII.GetString(buffer, 0, count).TrimEnd('\r');
+            var b = single[0];
+            if (b == (byte)'\n')
+            {
+                return Encoding.ASCII.GetString(buffer, 0, count).TrimEnd('\r');
+            }
+            buffer[count++] = b;
+        }
+        return Encoding.ASCII.GetString(buffer, 0, count).TrimEnd('\r');
+    }
+
+    private void StartDiscoveryListener()
+    {
+        _discoveryCts = new CancellationTokenSource();
+        var token = _discoveryCts.Token;
+        Task.Run(async () =>
+        {
+            try
+            {
+                _discoveryClient = new System.Net.Sockets.UdpClient();
+                _discoveryClient.Client.SetSocketOption(System.Net.Sockets.SocketOptionLevel.Socket, System.Net.Sockets.SocketOptionName.ReuseAddress, true);
+                _discoveryClient.Client.Bind(new IPEndPoint(IPAddress.Any, 8767));
+                while (!token.IsCancellationRequested)
+                {
+                    var result = await _discoveryClient.ReceiveAsync(token);
+                    var message = Encoding.UTF8.GetString(result.Buffer);
+                    // Format: "PHONECAM|http://192.168.x.x:8765/stream.mjpg|DeviceName"
+                    if (message.StartsWith("PHONECAM|", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = message.Split('|');
+                        if (parts.Length >= 2)
+                        {
+                            var url = parts[1];
+                            var name = parts.Length > 2 ? parts[2] : "Phonecam Device";
+                            await Dispatcher.InvokeAsync(() =>
+                            {
+                                if (!_isConnectingOrStreaming && (AddressBox.Text.Contains("127.0.0.1") || string.IsNullOrWhiteSpace(AddressBox.Text)))
+                                {
+                                    _discoveredAddress = url;
+                                    DiscoveredDeviceText.Text = $"{name} ({result.RemoteEndPoint.Address})";
+                                    DiscoveredPanel.Visibility = Visibility.Visible;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+        }, token);
+    }
+
+    private void ConnectDiscovered_Click(object sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrEmpty(_discoveredAddress))
+        {
+            AddressBox.Text = _discoveredAddress;
+            DiscoveredPanel.Visibility = Visibility.Collapsed;
+            Connect_Click(sender, e);
+        }
+    }
+
+    private void SetStatus(string message, bool connected, string? mode = null)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            StatusText.Text = message;
+            StatusDot.Fill = connected ? (Brush)FindResource("Accent") : new SolidColorBrush(Color.FromRgb(137, 151, 169));
+            if (connected && !string.IsNullOrEmpty(mode))
+            {
+                ConnectionModeText.Text = mode;
+                ModeBadge.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                ModeBadge.Visibility = Visibility.Collapsed;
+            }
+            if (!connected)
+            {
+                StatsText.Text = "";
+            }
+        });
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _streamCancellation?.Cancel();
+        _discoveryCts?.Cancel();
+        try { _discoveryClient?.Close(); } catch { }
+        if (_cameraHost is { HasExited: false })
+        {
+            try { _cameraHost.StandardInput.Close(); } catch { }
+            if (!_cameraHost.WaitForExit(1500))
+            {
+                try { _cameraHost.Kill(true); } catch { }
+            }
+        }
+        _http.Dispose();
+        _mmfAccessor?.Dispose();
+        _mmf?.Dispose();
+        _listener.Stop();
+        base.OnClosed(e);
+    }
+}

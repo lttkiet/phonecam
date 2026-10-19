@@ -1,0 +1,105 @@
+<Window x:Class="Phonecam.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Phonecam" Width="1050" Height="860" MinWidth="760" MinHeight="700" Background="#10151D" Foreground="{StaticResource Ink}" WindowStartupLocation="CenterScreen">
+  <Grid Margin="34">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
+    <Grid Grid.Row="0" Margin="0,0,0,22">
+      <StackPanel>
+        <TextBlock Text="Phonecam" FontSize="30" FontWeight="Bold" />
+        <TextBlock Text="Your phone camera, ready for Windows" Foreground="{StaticResource Muted}" Margin="0,4,0,0" />
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+        <Border x:Name="ModeBadge" CornerRadius="16" Background="#182330" BorderBrush="#25384D" BorderThickness="1" Padding="12,6" Margin="0,0,10,0" Visibility="Collapsed">
+          <TextBlock x:Name="ConnectionModeText" Text="USB" FontSize="12" FontWeight="SemiBold" Foreground="#00D2A0" />
+        </Border>
+        <Border CornerRadius="16" Background="#1D2732" Padding="13,7">
+          <StackPanel Orientation="Horizontal">
+            <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#8997A9" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <TextBlock x:Name="StatusText" Text="Waiting for phone" Foreground="{StaticResource Muted}" />
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </Grid>
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="2*" />
+        <ColumnDefinition Width="24" />
+        <ColumnDefinition Width="1*" />
+      </Grid.ColumnDefinitions>
+      <Border Grid.Column="0" Background="#0A0E15" CornerRadius="20" BorderBrush="#1F2A38" BorderThickness="1" ClipToBounds="True">
+        <Grid>
+          <Image x:Name="Preview" Stretch="Uniform" />
+          <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="360">
+            <!-- Sleek Camera Icon Illustration -->
+            <Border Width="64" Height="64" CornerRadius="32" Background="#162230" HorizontalAlignment="Center" Margin="0,0,0,16">
+              <Path Data="M 22 28 L 26 22 L 38 22 L 42 28 L 48 28 C 50.2 28 52 29.8 52 32 L 52 46 C 52 48.2 50.2 50 48 50 L 16 50 C 13.8 50 12 48.2 12 46 L 12 32 C 12 29.8 13.8 28 16 28 Z M 32 46 A 8 8 0 1 0 32 30 A 8 8 0 1 0 32 46 Z" Fill="#5C738D" HorizontalAlignment="Center" VerticalAlignment="Center" />
+            </Border>
+            <TextBlock Text="Waiting for a camera" FontSize="22" FontWeight="SemiBold" HorizontalAlignment="Center" Foreground="#F0F4F8" />
+            <TextBlock Text="Start Phonecam on your Android phone, then connect using its Wi-Fi address or USB." Foreground="{StaticResource Muted}" TextWrapping="Wrap" TextAlignment="Center" Margin="0,8,0,0" LineHeight="20" />
+          </StackPanel>
+          <Border VerticalAlignment="Bottom" HorizontalAlignment="Left" Margin="16" Background="#CC0D131B" CornerRadius="10" Padding="12,7" BorderBrush="#253446" BorderThickness="1">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock x:Name="ResolutionText" Text="No signal" FontSize="12" Foreground="{StaticResource Muted}" />
+              <TextBlock x:Name="StatsText" Text="" FontSize="12" Foreground="#00D2A0" Margin="12,0,0,0" FontWeight="SemiBold" />
+            </StackPanel>
+          </Border>
+        </Grid>
+      </Border>
+      <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,8,0">
+      <StackPanel>
+        <Border x:Name="DiscoveredPanel" Background="#1D2E2B" BorderBrush="#2C5248" BorderThickness="1" CornerRadius="12" Padding="12,10" Margin="0,0,0,14" Visibility="Collapsed">
+          <StackPanel>
+            <TextBlock Text="Discovered on Wi-Fi" FontWeight="SemiBold" Foreground="#70E1C1" FontSize="13" />
+            <TextBlock x:Name="DiscoveredDeviceText" Text="Phonecam detected" Foreground="{StaticResource Ink}" FontSize="12" Margin="0,2,0,6" />
+            <Button x:Name="ConnectDiscoveredButton" Content="Quick Connect" Background="#26473D" Foreground="#70E1C1" FontSize="12" Padding="8,4" HorizontalAlignment="Left" Click="ConnectDiscovered_Click" />
+          </StackPanel>
+        </Border>
+        <TextBlock Text="Connect phone" FontSize="18" FontWeight="SemiBold" />
+        <TextBlock Text="Use the address shown in the Phonecam app." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,5,0,13" />
+        <TextBox x:Name="AddressBox" Text="http://127.0.0.1:18765/stream.mjpg" Padding="12,10" Background="#1B2530" Foreground="{StaticResource Ink}" BorderBrush="#344353" CaretBrush="White" FontSize="14" />
+        <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+          <Button x:Name="ConnectButton" Content="Connect camera" HorizontalAlignment="Left" Click="Connect_Click" />
+          <CheckBox x:Name="AutoReconnectBox" Content="Auto-reconnect" IsChecked="True" Foreground="{StaticResource Ink}" VerticalAlignment="Center" Margin="14,0,0,0" />
+        </StackPanel>
+        <Border Background="{StaticResource CardBg}" BorderBrush="{StaticResource CardBorder}" BorderThickness="1" CornerRadius="14" Padding="16" Margin="0,20,0,0">
+          <StackPanel>
+            <TextBlock Text="Windows webcam" FontSize="15" FontWeight="SemiBold" />
+            <TextBlock x:Name="CameraDeviceText" Text="Starting Phonecam camera..." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,8,0,0" />
+            <Button x:Name="InstallCameraButton" Content="Install Windows camera" Background="#263445" Foreground="{StaticResource Ink}" HorizontalAlignment="Left" Margin="0,12,0,0" Visibility="Collapsed" Click="InstallCamera_Click" />
+            <TextBlock Text="Then choose Phonecam (Windows Virtual Camera) in Zoom, Teams, Discord, or another camera app." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,10,0,0" />
+          </StackPanel>
+        </Border>
+        <Border Background="{StaticResource CardBg}" BorderBrush="{StaticResource CardBorder}" BorderThickness="1" CornerRadius="14" Padding="16" Margin="0,14,0,0">
+          <StackPanel>
+            <TextBlock Text="Phone camera settings" FontSize="15" FontWeight="SemiBold" />
+            <TextBlock Text="Changes apply to the live phone camera." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,10" />
+            <TextBlock Text="Camera" Foreground="{StaticResource Muted}" FontSize="12" />
+            <ComboBox x:Name="CameraSettingsBox" IsEnabled="False" DisplayMemberPath="Label" SelectionChanged="CameraSettings_SelectionChanged" Margin="0,4,0,8" />
+            <TextBlock Text="Resolution" Foreground="{StaticResource Muted}" FontSize="12" />
+            <ComboBox x:Name="ResolutionSettingsBox" IsEnabled="False" DisplayMemberPath="Label" SelectionChanged="CameraSettings_SelectionChanged" Margin="0,4,0,8" />
+            <TextBlock Text="Frame rate" Foreground="{StaticResource Muted}" FontSize="12" />
+            <ComboBox x:Name="FrameRateSettingsBox" IsEnabled="False" DisplayMemberPath="Label" SelectionChanged="CameraSettings_SelectionChanged" Margin="0,4,0,8" />
+            <TextBlock Text="JPEG quality" Foreground="{StaticResource Muted}" FontSize="12" />
+            <ComboBox x:Name="QualitySettingsBox" IsEnabled="False" SelectionChanged="CameraSettings_SelectionChanged" Margin="0,4,0,0">
+              <ComboBoxItem Content="Standard - 60" Tag="60" />
+              <ComboBoxItem Content="High - 75" Tag="75" />
+              <ComboBoxItem Content="Best - 90" Tag="90" />
+            </ComboBox>
+            <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+              <CheckBox x:Name="MirrorBox" Content="Mirror webcam video" Foreground="{StaticResource Ink}" VerticalAlignment="Center" Click="MirrorBox_Click" />
+              <Button x:Name="TorchButton" Content="Torch: Off" Background="#263445" Foreground="{StaticResource Ink}" Padding="12,6" Margin="16,0,0,0" IsEnabled="False" Click="TorchButton_Click" />
+            </StackPanel>
+            <TextBlock x:Name="SettingsStatusText" Text="Connect to a phone to change settings." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,10,0,0" />
+          </StackPanel>
+        </Border>
+        <TextBlock Text="USB connection" FontSize="15" FontWeight="SemiBold" Margin="0,20,0,0" />
+        <TextBlock Text="Connect the phone with USB debugging enabled. Phonecam sets up the ADB port forward when you connect." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,7,0,0" />
+        <Button x:Name="AutoDetectUsbButton" Content="Detect &amp; Connect USB Phone" Background="#263445" Foreground="{StaticResource Ink}" Margin="0,10,0,0" HorizontalAlignment="Left" Click="AutoDetectUsb_Click" />
+      </StackPanel>
+      </ScrollViewer>
+    </Grid>
+    <TextBlock Grid.Row="2" Text="Phone and Windows stay on your local connection. Video is not sent to a cloud service." Foreground="{StaticResource Muted}" Margin="0,18,0,0" />
+  </Grid>
+</Window>

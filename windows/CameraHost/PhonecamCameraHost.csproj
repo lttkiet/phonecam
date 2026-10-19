@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AssemblyName>PhonecamCameraHost</AssemblyName>
+    <RootNamespace>PhonecamCameraHost</RootNamespace>
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="DirectNAot.Extensions" Version="1.7.0" />
+    <Compile Include="..\CameraSource\Shared.cs" Link="Shared.cs" />
+    <Compile Remove="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Using Include="DirectN" />
+    <Using Include="DirectN.Extensions.Com" />
+    <Using Include="DirectN.Extensions.Utilities" />
+    <Using Include="PhonecamCameraSource" />
+    <Using Include="System" />
+    <Using Include="System.ComponentModel" />
+    <Using Include="System.Runtime.InteropServices" />
+    <Using Include="System.Threading" />
+  </ItemGroup>
+</Project>
