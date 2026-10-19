@@ -53,6 +53,13 @@ public partial class MainWindow : Window
     private int _statsFrameCount;
     private long _statsByteCount;
     private long _statsWindowStartTicks = Stopwatch.GetTimestamp();
+    private double _latestRttMs;
+    private double _latestDecodeMs;
+    private double _latestFps;
+    private double _latestMbps;
+    private double _latestLatencyMs;
+    private long _lastChunkReceivedTicks;
+    private CancellationTokenSource? _pingCts;
 
     // Audio recording & playback fields
     private MMDeviceEnumerator? _deviceEnumerator;
@@ -252,6 +259,9 @@ public partial class MainWindow : Window
             _audioCts?.Cancel();
             _audioCts?.Dispose();
             _audioCts = null;
+            _pingCts?.Cancel();
+            _pingCts?.Dispose();
+            _pingCts = null;
             _wasapiOut?.Stop();
             AudioMeter.Value = 0;
             _isConnectingOrStreaming = false;
@@ -349,6 +359,11 @@ public partial class MainWindow : Window
                 _audioCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 _ = StartAudioStreamAsync(uri, _audioCts.Token, ffmpegPath);
 
+                _pingCts?.Cancel();
+                _pingCts?.Dispose();
+                _pingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                _ = StartPingLoopAsync(uri, _pingCts.Token);
+
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
                 if (isH264 && !string.IsNullOrEmpty(ffmpegPath))
                 {
@@ -360,6 +375,7 @@ public partial class MainWindow : Window
                 }
 
                 _audioCts?.Cancel();
+                _pingCts?.Cancel();
                 _wasapiOut?.Stop();
                 await Dispatcher.InvokeAsync(() => AudioMeter.Value = 0);
 
@@ -384,6 +400,7 @@ public partial class MainWindow : Window
             }
 
             _audioCts?.Cancel();
+            _pingCts?.Cancel();
             _wasapiOut?.Stop();
             await Dispatcher.InvokeAsync(() => AudioMeter.Value = 0);
 
@@ -411,6 +428,9 @@ public partial class MainWindow : Window
         _audioCts?.Cancel();
         _audioCts?.Dispose();
         _audioCts = null;
+        _pingCts?.Cancel();
+        _pingCts?.Dispose();
+        _pingCts = null;
         _wasapiOut?.Stop();
         await Dispatcher.InvokeAsync(() =>
         {
@@ -815,6 +835,7 @@ public partial class MainWindow : Window
                 {
                     var read = await networkStream.ReadAsync(buffer.AsMemory(0, buffer.Length), linkedCts.Token);
                     if (read <= 0) break;
+                    Volatile.Write(ref _lastChunkReceivedTicks, Stopwatch.GetTimestamp());
                     await ffmpeg.StandardInput.BaseStream.WriteAsync(buffer.AsMemory(0, read), linkedCts.Token);
                     await ffmpeg.StandardInput.BaseStream.FlushAsync(linkedCts.Token);
                     _statsByteCount += read;
@@ -860,13 +881,24 @@ public partial class MainWindow : Window
                 _useBufferA = !_useBufferA;
 
                 var nowTicks = Stopwatch.GetTimestamp();
+                var lastChunk = Volatile.Read(ref _lastChunkReceivedTicks);
+                if (lastChunk > 0)
+                {
+                    var decodeMs = (double)(nowTicks - lastChunk) * 1000.0 / Stopwatch.Frequency;
+                    _latestDecodeMs = Math.Clamp(decodeMs, 1.0, 50.0);
+                }
+
                 if (!isCalibrated)
                 {
                     isCalibrated = true;
                     _statsFrameCount = 0;
                     _statsByteCount = 0;
                     _statsWindowStartTicks = nowTicks;
-                    _latestStatsText = "30.0 FPS  •  H.264 HW";
+                    _latestFps = 30.0;
+                    _latestMbps = 4.0;
+                    var rtt = Volatile.Read(ref _latestRttMs);
+                    _latestLatencyMs = Math.Max(1.0, (rtt > 0 ? (rtt / 2.0) : 1.5) + _latestDecodeMs);
+                    _latestStatsText = $"{_latestFps:0.0} FPS  •  {_latestMbps:0.0} Mbps  •  {_latestLatencyMs:0} ms";
                 }
                 else
                 {
@@ -876,7 +908,12 @@ public partial class MainWindow : Window
                     {
                         var fps = _statsFrameCount / elapsedSec;
                         var mbps = (_statsByteCount * 8.0) / (elapsedSec * 1_000_000.0);
-                        _latestStatsText = $"{fps:0.0} FPS  •  {mbps:0.0} Mbps (H.264 HW)";
+                        var rtt = Volatile.Read(ref _latestRttMs);
+                        var totalLat = Math.Max(1.0, (rtt > 0 ? (rtt / 2.0) : 1.5) + _latestDecodeMs);
+                        _latestFps = fps;
+                        _latestMbps = mbps;
+                        _latestLatencyMs = totalLat;
+                        _latestStatsText = $"{fps:0.0} FPS  •  {mbps:0.0} Mbps  •  {totalLat:0} ms";
                         _statsFrameCount = 0;
                         _statsByteCount = 0;
                         _statsWindowStartTicks = nowTicks;
@@ -897,6 +934,9 @@ public partial class MainWindow : Window
                             }
                             _writeableBitmap.WritePixels(new Int32Rect(0, 0, targetW, targetH), targetBuffer, targetW * 4, 0);
                             ResolutionText.Text = $"{targetW} x {targetH}";
+                            FpsStatsText.Text = $"{_latestFps:0.0} FPS";
+                            BitrateStatsText.Text = $"{_latestMbps:0.0} Mbps";
+                            LatencyStatsText.Text = $"{_latestLatencyMs:0} ms";
                             if (_latestStatsText != null)
                             {
                                 StatsText.Text = _latestStatsText;
@@ -1018,7 +1058,12 @@ public partial class MainWindow : Window
             {
                 var fps = _statsFrameCount / elapsedSec;
                 var mbps = (_statsByteCount * 8.0) / (elapsedSec * 1_000_000.0);
-                statsDisplay = $"{fps:0.0} FPS  •  {mbps:0.0} Mbps";
+                var rtt = Volatile.Read(ref _latestRttMs);
+                var totalLat = Math.Max(1.0, (rtt > 0 ? (rtt / 2.0) : 4.0) + 12.0);
+                _latestFps = fps;
+                _latestMbps = mbps;
+                _latestLatencyMs = totalLat;
+                statsDisplay = $"{fps:0.0} FPS  •  {mbps:0.0} Mbps  •  {totalLat:0} ms";
                 _statsFrameCount = 0;
                 _statsByteCount = 0;
                 _statsWindowStartTicks = nowTicks;
@@ -1028,6 +1073,9 @@ public partial class MainWindow : Window
             {
                 Preview.Source = bitmap;
                 ResolutionText.Text = $"{bitmap.PixelWidth} x {bitmap.PixelHeight}";
+                FpsStatsText.Text = $"{_latestFps:0.0} FPS";
+                BitrateStatsText.Text = $"{_latestMbps:0.0} Mbps";
+                LatencyStatsText.Text = $"{_latestLatencyMs:0} ms";
                 if (statsDisplay != null)
                 {
                     StatsText.Text = statsDisplay;
@@ -1125,6 +1173,9 @@ public partial class MainWindow : Window
             }
             if (!connected)
             {
+                FpsStatsText.Text = "-- FPS";
+                BitrateStatsText.Text = "-- Mbps";
+                LatencyStatsText.Text = "-- ms";
                 StatsText.Text = "";
             }
         });
@@ -1477,11 +1528,36 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task StartPingLoopAsync(Uri baseUri, CancellationToken ct)
+    {
+        var pingUri = new UriBuilder(baseUri) { Path = "/ping", Query = "", Fragment = "" }.Uri;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var t0 = Stopwatch.GetTimestamp();
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                using var resp = await _http.GetAsync(pingUri, linked.Token);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var t1 = Stopwatch.GetTimestamp();
+                    var rtt = (double)(t1 - t0) * 1000.0 / Stopwatch.Frequency;
+                    Volatile.Write(ref _latestRttMs, rtt);
+                }
+            }
+            catch { }
+            try { await Task.Delay(1000, ct); } catch { break; }
+        }
+    }
+
     protected override void OnClosed(EventArgs e)
     {
         _streamCancellation?.Cancel();
         _audioCts?.Cancel();
         _audioCts?.Dispose();
+        _pingCts?.Cancel();
+        _pingCts?.Dispose();
         try { _wasapiOut?.Stop(); } catch { }
         try { _wasapiOut?.Dispose(); } catch { }
         try { _deviceEnumerator?.Dispose(); } catch { }

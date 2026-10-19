@@ -39,10 +39,19 @@
             <TextBlock Text="Waiting for a camera" FontSize="22" FontWeight="SemiBold" HorizontalAlignment="Center" Foreground="#F0F4F8" />
             <TextBlock Text="Start Phonecam on your Android phone, then connect using its Wi-Fi address or USB." Foreground="{StaticResource Muted}" TextWrapping="Wrap" TextAlignment="Center" Margin="0,8,0,0" LineHeight="20" />
           </StackPanel>
-          <Border VerticalAlignment="Bottom" HorizontalAlignment="Left" Margin="16" Background="#CC0D131B" CornerRadius="10" Padding="12,7" BorderBrush="#253446" BorderThickness="1">
-            <StackPanel Orientation="Horizontal">
-              <TextBlock x:Name="ResolutionText" Text="No signal" FontSize="12" Foreground="{StaticResource Muted}" />
-              <TextBlock x:Name="StatsText" Text="" FontSize="12" Foreground="#00D2A0" Margin="12,0,0,0" FontWeight="SemiBold" />
+          <Border VerticalAlignment="Bottom" HorizontalAlignment="Left" Margin="16" Background="#DD0B1017" CornerRadius="10" Padding="14,8" BorderBrush="#253446" BorderThickness="1">
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+              <TextBlock x:Name="ResolutionText" Text="No signal" FontSize="12" Foreground="{StaticResource Muted}" FontWeight="Medium" VerticalAlignment="Center" />
+              <Border Width="1" Height="12" Background="#2A3849" Margin="10,0" VerticalAlignment="Center" />
+              <TextBlock Text="FPS:" FontSize="11" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,4,0" />
+              <TextBlock x:Name="FpsStatsText" Text="-- " FontSize="12" Foreground="#00D2A0" FontWeight="SemiBold" VerticalAlignment="Center" />
+              <Border Width="1" Height="12" Background="#2A3849" Margin="10,0" VerticalAlignment="Center" />
+              <TextBlock Text="Bitrate:" FontSize="11" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,4,0" />
+              <TextBlock x:Name="BitrateStatsText" Text="-- " FontSize="12" Foreground="#70E1C1" FontWeight="SemiBold" VerticalAlignment="Center" />
+              <Border Width="1" Height="12" Background="#2A3849" Margin="10,0" VerticalAlignment="Center" />
+              <TextBlock Text="Latency:" FontSize="11" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,4,0" />
+              <TextBlock x:Name="LatencyStatsText" Text="-- " FontSize="12" Foreground="#64B5F6" FontWeight="SemiBold" VerticalAlignment="Center" />
+              <TextBlock x:Name="StatsText" Text="" Visibility="Collapsed" />
             </StackPanel>
           </Border>
         </Grid>

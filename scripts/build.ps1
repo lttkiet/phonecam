@@ -50,7 +50,7 @@ Copy-Item (Join-Path $root 'windows\CameraSource\VCamNetSample-LICENSE.txt') (Jo
 $classes = Join-Path $build 'classes'
 New-Item $classes -ItemType Directory -Force | Out-Null
 $javaFiles = Get-ChildItem (Join-Path $root 'android\src') -Filter '*.java' -Recurse | ForEach-Object FullName
-    & (Join-Path $env:JAVA_HOME 'bin\javac.exe') --release 17 -classpath $androidJar -d $classes $javaFiles
+    & (Join-Path $env:JAVA_HOME 'bin\javac.exe') --release 17 -encoding UTF-8 -classpath $androidJar -d $classes $javaFiles
 if ($LASTEXITCODE -ne 0) { throw 'Android Java compile failed.' }
 
 $baseApk = Join-Path $build 'base.apk'

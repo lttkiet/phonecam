@@ -9,8 +9,10 @@ import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
+import android.graphics.Matrix;
 import android.graphics.drawable.GradientDrawable;
 import android.widget.ImageView;
+import android.widget.FrameLayout;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import android.hardware.camera2.CameraAccessException;
@@ -127,8 +129,10 @@ public final class MainActivity extends Activity {
     private Spinner qualitySpinner;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
+    private FrameLayout miniViewfinderContainer;
     private ImageView viewfinder;
     private boolean showViewfinder = false;
+    private long lastVfUpdate = 0;
     private Button viewfinderButton;
     private Button qrButton;
     private View qrModal;
@@ -303,7 +307,7 @@ public final class MainActivity extends Activity {
         btnRow2.setPadding(0, 0, 0, 14);
 
         viewfinderButton = new Button(this);
-        viewfinderButton.setText("Preview: OFF");
+        viewfinderButton.setText("Mini Preview: OFF");
         styleModernButton(viewfinderButton, 0xff202d3d, 0xffffffff);
         viewfinderButton.setOnClickListener(v -> toggleViewfinder());
         LinearLayout.LayoutParams vfParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
@@ -332,20 +336,6 @@ public final class MainActivity extends Activity {
         btnRow3.addView(micUiButton, micParams);
         root.addView(btnRow3, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        viewfinder = new ImageView(this);
-        viewfinder.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        viewfinder.setBackgroundColor(0xff080b10);
-        GradientDrawable vfBg = new GradientDrawable();
-        vfBg.setColor(0xff080b10);
-        vfBg.setCornerRadius(18);
-        vfBg.setStroke(2, 0xff223142);
-        viewfinder.setBackground(vfBg);
-        viewfinder.setClipToOutline(true);
-        viewfinder.setVisibility(View.GONE);
-        LinearLayout.LayoutParams vfViewParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 320);
-        vfViewParams.setMargins(0, 4, 0, 16);
-        root.addView(viewfinder, vfViewParams);
-
         dimmerOverlay = new View(this);
         dimmerOverlay.setBackgroundColor(0xff000000);
         dimmerOverlay.setVisibility(View.GONE);
@@ -355,6 +345,7 @@ public final class MainActivity extends Activity {
 
         android.widget.FrameLayout container = new android.widget.FrameLayout(this);
         container.addView(root, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
+        buildMiniViewfinder(container);
         container.addView(dimmerOverlay, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
         container.addView(qrModal, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -597,13 +588,105 @@ public final class MainActivity extends Activity {
 
     private void toggleViewfinder() {
         showViewfinder = !showViewfinder;
-        if (viewfinder != null) {
-            viewfinder.setVisibility(showViewfinder ? View.VISIBLE : View.GONE);
-            if (!showViewfinder) viewfinder.setImageBitmap(null);
+        if (miniViewfinderContainer != null) {
+            miniViewfinderContainer.setVisibility(showViewfinder ? View.VISIBLE : View.GONE);
+        }
+        if (viewfinder != null && !showViewfinder) {
+            viewfinder.setImageBitmap(null);
         }
         if (viewfinderButton != null) {
-            viewfinderButton.setText(showViewfinder ? "Preview: ON" : "Preview: OFF");
+            viewfinderButton.setText(showViewfinder ? "Mini Preview: ON" : "Mini Preview: OFF");
+            viewfinderButton.setTextColor(showViewfinder ? 0xff00d2a0 : 0xffffffff);
         }
+    }
+
+    private void buildMiniViewfinder(FrameLayout parent) {
+        miniViewfinderContainer = new FrameLayout(this);
+        int widthPx = (int) (180 * getResources().getDisplayMetrics().density);
+        int heightPx = (int) (130 * getResources().getDisplayMetrics().density);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(widthPx, heightPx);
+        lp.gravity = Gravity.BOTTOM | Gravity.END;
+        int marginPx = (int) (16 * getResources().getDisplayMetrics().density);
+        lp.setMargins(0, 0, marginPx, (int) (40 * getResources().getDisplayMetrics().density));
+        miniViewfinderContainer.setLayoutParams(lp);
+
+        GradientDrawable cardBg = new GradientDrawable();
+        cardBg.setColor(0xf0101722);
+        cardBg.setCornerRadius((int) (18 * getResources().getDisplayMetrics().density));
+        cardBg.setStroke((int) (2 * getResources().getDisplayMetrics().density), 0xff00d2a0);
+        miniViewfinderContainer.setBackground(cardBg);
+        miniViewfinderContainer.setClipToOutline(true);
+        miniViewfinderContainer.setElevation(20);
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        int hPadX = (int) (10 * getResources().getDisplayMetrics().density);
+        int hPadY = (int) (4 * getResources().getDisplayMetrics().density);
+        header.setPadding(hPadX, hPadY, hPadX, hPadY);
+        header.setBackgroundColor(0xff162230);
+
+        View dot = new View(this);
+        GradientDrawable dotBg = new GradientDrawable();
+        dotBg.setShape(GradientDrawable.OVAL);
+        dotBg.setColor(0xff00d2a0);
+        dot.setBackground(dotBg);
+        int dotSize = (int) (7 * getResources().getDisplayMetrics().density);
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dotSize, dotSize);
+        dotLp.setMargins(0, 0, (int) (6 * getResources().getDisplayMetrics().density), 0);
+        header.addView(dot, dotLp);
+
+        TextView miniVfTitle = new TextView(this);
+        miniVfTitle.setText("MINI PREVIEW");
+        miniVfTitle.setTextSize(10);
+        miniVfTitle.setTextColor(0xff00d2a0);
+        miniVfTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        header.addView(miniVfTitle, titleLp);
+
+        TextView closeBtn = new TextView(this);
+        closeBtn.setText("\u2715");
+        closeBtn.setTextSize(13);
+        closeBtn.setTextColor(0xff8b9bae);
+        closeBtn.setPadding((int) (8 * getResources().getDisplayMetrics().density), 0, (int) (4 * getResources().getDisplayMetrics().density), 0);
+        closeBtn.setOnClickListener(v -> toggleViewfinder());
+        header.addView(closeBtn);
+
+        layout.addView(header, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        viewfinder = new ImageView(this);
+        viewfinder.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        viewfinder.setBackgroundColor(0xff080c12);
+        LinearLayout.LayoutParams vfLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT);
+        layout.addView(viewfinder, vfLp);
+
+        miniViewfinderContainer.addView(layout, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        miniViewfinderContainer.setOnTouchListener(new View.OnTouchListener() {
+            private float dX, dY;
+            @Override
+            public boolean onTouch(View view, android.view.MotionEvent event) {
+                switch (event.getActionMasked()) {
+                    case android.view.MotionEvent.ACTION_DOWN:
+                        dX = view.getX() - event.getRawX();
+                        dY = view.getY() - event.getRawY();
+                        return true;
+                    case android.view.MotionEvent.ACTION_MOVE:
+                        view.setX(event.getRawX() + dX);
+                        view.setY(event.getRawY() + dY);
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+        });
+
+        miniViewfinderContainer.setVisibility(View.GONE);
+        parent.addView(miniViewfinderContainer);
     }
 
     private void buildQrModal() {
@@ -884,13 +967,32 @@ public final class MainActivity extends Activity {
                         lastUiUpdateTime = nowMs;
                         if (state != null && frameData.length > 0) runOnUiThread(() -> {
                             state.setText(front ? "Front camera streaming" : "Back camera streaming");
-                            if (showViewfinder && viewfinder != null) {
-                                try {
-                                    Bitmap bmp = BitmapFactory.decodeByteArray(frameData, 0, frameData.length);
-                                    viewfinder.setImageBitmap(bmp);
-                                } catch (Exception ignored) {}
-                            }
                         });
+                    }
+
+                    if (showViewfinder && viewfinder != null && nowMs - lastVfUpdate >= 50) {
+                        lastVfUpdate = nowMs;
+                        try {
+                            BitmapFactory.Options opts = new BitmapFactory.Options();
+                            opts.inSampleSize = (w >= 1920) ? 4 : 2;
+                            Bitmap bmp = BitmapFactory.decodeByteArray(frameData, 0, frameData.length, opts);
+                            if (bmp != null) {
+                                if (rotationDegrees != 0 || front) {
+                                    Matrix matrix = new Matrix();
+                                    if (rotationDegrees != 0) matrix.postRotate(rotationDegrees);
+                                    if (front) matrix.postScale(-1, 1);
+                                    Bitmap rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), matrix, true);
+                                    bmp.recycle();
+                                    bmp = rotated;
+                                }
+                                final Bitmap finalBmp = bmp;
+                                runOnUiThread(() -> {
+                                    if (showViewfinder && viewfinder != null) {
+                                        viewfinder.setImageBitmap(finalBmp);
+                                    }
+                                });
+                            }
+                        } catch (Exception ignored) {}
                     }
                 } catch (IllegalStateException e) {
                     Log.w("Phonecam", "Buffer invalidated during camera switch: " + e.getMessage());
@@ -1439,6 +1541,13 @@ public final class MainActivity extends Activity {
             String[] request = lines[0].split(" ");
             String method = request.length > 0 ? request[0] : "";
             String path = request.length > 1 ? request[1].split("\\?", 2)[0] : "";
+            if ("GET".equals(method) && "/ping".equals(path)) {
+                byte[] resp = "pong".getBytes(StandardCharsets.US_ASCII);
+                out.write(("HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: text/plain\r\nContent-Length: " + resp.length + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+                out.write(resp);
+                out.flush();
+                return;
+            }
             if ("GET".equals(method) && "/settings".equals(path)) {
                 writeJson(out, "200 OK", onUi(this::settingsJson));
                 return;
