@@ -10,6 +10,8 @@ using System.Windows.Media.Imaging;
 using Microsoft.Win32;
 using System.IO.MemoryMappedFiles;
 using PhonecamCameraSource;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
 
 namespace Phonecam;
 
@@ -52,16 +54,27 @@ public partial class MainWindow : Window
     private long _statsByteCount;
     private long _statsWindowStartTicks = Stopwatch.GetTimestamp();
 
+    // Audio recording & playback fields
+    private MMDeviceEnumerator? _deviceEnumerator;
+    private MMDevice? _selectedAudioDevice;
+    private WasapiOut? _wasapiOut;
+    private BufferedWaveProvider? _waveProvider;
+    private volatile bool _micMuted;
+    private volatile float _audioVolume = 1.0f;
+    private CancellationTokenSource? _audioCts;
+
     private sealed record CameraOption(string Id, string Label);
     private sealed record SizeOption(int Width, int Height, string Label);
     private sealed record FpsOption(int Min, int Max, string Label);
     private sealed record CameraResolution(int Width, int Height);
+    private sealed record AudioDeviceOption(string Id, string Name, MMDevice Device);
 
     public MainWindow()
     {
         InitializeComponent();
         InitializeSharedMemory();
         StartDiscoveryListener();
+        InitializeAudioDevices();
         if (CameraSourceRegistered()) CameraDeviceText.Text = "Connect to your phone to start the Windows camera.";
         else
         {
@@ -236,6 +249,11 @@ public partial class MainWindow : Window
         if (_isConnectingOrStreaming)
         {
             _streamCancellation?.Cancel();
+            _audioCts?.Cancel();
+            _audioCts?.Dispose();
+            _audioCts = null;
+            _wasapiOut?.Stop();
+            AudioMeter.Value = 0;
             _isConnectingOrStreaming = false;
             ConnectButton.Content = "Connect camera";
             SetStatus("Disconnected", false);
@@ -326,6 +344,11 @@ public partial class MainWindow : Window
                 SetStatus("Connected", true, isUsb ? (isH264 ? "USB (H.264 HW)" : "USB") : (isH264 ? "Wi-Fi (H.264 HW)" : "Wi-Fi"));
                 retryDelay = TimeSpan.FromSeconds(1); // Reset backoff on successful connection
 
+                _audioCts?.Cancel();
+                _audioCts?.Dispose();
+                _audioCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                _ = StartAudioStreamAsync(uri, _audioCts.Token, ffmpegPath);
+
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
                 if (isH264 && !string.IsNullOrEmpty(ffmpegPath))
                 {
@@ -335,6 +358,10 @@ public partial class MainWindow : Window
                 {
                     await ReadMultipartAsync(stream, cancellationToken);
                 }
+
+                _audioCts?.Cancel();
+                _wasapiOut?.Stop();
+                await Dispatcher.InvokeAsync(() => AudioMeter.Value = 0);
 
                 if (cancellationToken.IsCancellationRequested || !_isConnectingOrStreaming) break;
                 SetStatus("Phone closed the camera stream", false);
@@ -355,6 +382,10 @@ public partial class MainWindow : Window
             {
                 SetStatus($"Stream error: {error.Message}", false);
             }
+
+            _audioCts?.Cancel();
+            _wasapiOut?.Stop();
+            await Dispatcher.InvokeAsync(() => AudioMeter.Value = 0);
 
             var autoReconnect = await Dispatcher.InvokeAsync(() => AutoReconnectBox.IsChecked == true);
             if (!autoReconnect || cancellationToken.IsCancellationRequested || !_isConnectingOrStreaming)
@@ -377,8 +408,13 @@ public partial class MainWindow : Window
             retryDelay = TimeSpan.FromSeconds(Math.Min(maxRetryDelay.TotalSeconds, retryDelay.TotalSeconds * 1.5));
         }
 
+        _audioCts?.Cancel();
+        _audioCts?.Dispose();
+        _audioCts = null;
+        _wasapiOut?.Stop();
         await Dispatcher.InvokeAsync(() =>
         {
+            AudioMeter.Value = 0;
             _isConnectingOrStreaming = false;
             ConnectButton.Content = "Connect camera";
             EmptyState.Visibility = Visibility.Visible;
@@ -432,6 +468,13 @@ public partial class MainWindow : Window
         _torchActive = root.TryGetProperty("torch", out var torchProp) && torchProp.GetBoolean();
         TorchButton.IsEnabled = _hasTorch;
         TorchButton.Content = _torchActive ? "Torch: ON" : "Torch: OFF";
+
+        if (root.TryGetProperty("micMuted", out var micProp))
+        {
+            _micMuted = micProp.GetBoolean();
+            MicMuteButton.Content = _micMuted ? "Mic: MUTED" : "Mic: ON";
+            MicMuteButton.Background = _micMuted ? new SolidColorBrush(Color.FromRgb(180, 50, 50)) : new SolidColorBrush(Color.FromRgb(38, 52, 69));
+        }
 
         _updatingPhoneSettings = false;
         SetSettingsEnabled(cameras.Length > 0 && sizes.Length > 0 && fps.Length > 0);
@@ -1087,9 +1130,361 @@ public partial class MainWindow : Window
         });
     }
 
+    private void InitializeAudioDevices()
+    {
+        try
+        {
+            _deviceEnumerator ??= new MMDeviceEnumerator();
+            var devices = new List<AudioDeviceOption>();
+            var renderDevices = _deviceEnumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
+
+            MMDevice? cableDevice = null;
+            MMDevice? defaultDevice = null;
+            try
+            {
+                defaultDevice = _deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            }
+            catch { }
+
+            foreach (var dev in renderDevices)
+            {
+                var name = dev.FriendlyName;
+                devices.Add(new AudioDeviceOption(dev.ID, name, dev));
+                if (name.Contains("CABLE Input", StringComparison.OrdinalIgnoreCase))
+                {
+                    cableDevice = dev;
+                }
+            }
+
+            AudioDeviceBox.DisplayMemberPath = "Name";
+            AudioDeviceBox.ItemsSource = devices;
+
+            if (cableDevice != null)
+            {
+                MicDeviceText.Text = "VB-CABLE Virtual Microphone detected. Ready for Discord, Zoom, Teams.";
+                InstallMicButton.Visibility = Visibility.Collapsed;
+                AudioDeviceBox.SelectedItem = devices.FirstOrDefault(d => d.Device.ID == cableDevice.ID);
+            }
+            else
+            {
+                MicDeviceText.Text = "VB-CABLE driver not installed. Install it to route Phonecam audio into Zoom/Discord/Teams.";
+                InstallMicButton.Visibility = Visibility.Visible;
+                if (defaultDevice != null)
+                {
+                    AudioDeviceBox.SelectedItem = devices.FirstOrDefault(d => d.Device.ID == defaultDevice.ID);
+                }
+                else if (devices.Count > 0)
+                {
+                    AudioDeviceBox.SelectedIndex = 0;
+                }
+            }
+
+            if (AudioDeviceBox.SelectedItem is AudioDeviceOption selected)
+            {
+                _selectedAudioDevice = selected.Device;
+                SetupWasapiOutput();
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Failed to enumerate audio devices: {ex.Message}");
+            MicDeviceText.Text = $"Audio setup error: {ex.Message}";
+        }
+    }
+
+    private async void InstallMicrophone_Click(object sender, RoutedEventArgs e)
+    {
+        InstallMicButton.IsEnabled = false;
+        MicDeviceText.Text = "Installing VB-CABLE Virtual Microphone driver (Admin prompt may appear)...";
+        try
+        {
+            var candidates = new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "install-microphone.ps1"),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "scripts", "install-microphone.ps1")),
+                Path.Combine(Environment.CurrentDirectory, "scripts", "install-microphone.ps1")
+            };
+            var script = candidates.FirstOrDefault(File.Exists);
+            if (script is not null)
+            {
+                var psi = new ProcessStartInfo("powershell.exe")
+                {
+                    Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{script}\"",
+                    UseShellExecute = true,
+                    Verb = "runas"
+                };
+                var p = Process.Start(psi);
+                if (p is not null) await p.WaitForExitAsync();
+            }
+            else
+            {
+                var exeCandidates = new[]
+                {
+                    Path.Combine(AppContext.BaseDirectory, "vbcable", "VBCABLE_Setup_x64.exe"),
+                    Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "windows", "vbcable", "VBCABLE_Setup_x64.exe")),
+                    Path.Combine(Environment.CurrentDirectory, "windows", "vbcable", "VBCABLE_Setup_x64.exe")
+                };
+                var exe = exeCandidates.FirstOrDefault(File.Exists);
+                if (exe is not null)
+                {
+                    var psi = new ProcessStartInfo(exe)
+                    {
+                        Arguments = "-i -h",
+                        WorkingDirectory = Path.GetDirectoryName(exe),
+                        UseShellExecute = true,
+                        Verb = "runas"
+                    };
+                    var p = Process.Start(psi);
+                    if (p is not null) await p.WaitForExitAsync();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            MicDeviceText.Text = $"Driver installation failed: {ex.Message}";
+        }
+        finally
+        {
+            await Task.Delay(1500);
+            InitializeAudioDevices();
+            InstallMicButton.IsEnabled = true;
+        }
+    }
+
+    private void AudioDeviceBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (AudioDeviceBox.SelectedItem is AudioDeviceOption opt && opt.Device != _selectedAudioDevice)
+        {
+            _selectedAudioDevice = opt.Device;
+            SetupWasapiOutput();
+        }
+    }
+
+    private async void MicMuteButton_Click(object sender, RoutedEventArgs e)
+    {
+        _micMuted = !_micMuted;
+        MicMuteButton.Content = _micMuted ? "Mic: MUTED" : "Mic: ON";
+        MicMuteButton.Background = _micMuted ? new SolidColorBrush(Color.FromRgb(180, 50, 50)) : new SolidColorBrush(Color.FromRgb(38, 52, 69));
+        if (_micMuted)
+        {
+            AudioMeter.Value = 0;
+        }
+
+        if (_settingsUri != null)
+        {
+            try
+            {
+                var payload = JsonSerializer.Serialize(new { micMuted = _micMuted });
+                using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                await _http.PostAsync(_settingsUri, content, timeout.Token);
+            }
+            catch { }
+        }
+    }
+
+    private void VolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _audioVolume = (float)e.NewValue;
+    }
+
+    private void SetupWasapiOutput()
+    {
+        if (_selectedAudioDevice == null) return;
+        try
+        {
+            if (_wasapiOut != null)
+            {
+                try { _wasapiOut.Stop(); } catch { }
+                try { _wasapiOut.Dispose(); } catch { }
+                _wasapiOut = null;
+            }
+
+            _waveProvider = new BufferedWaveProvider(new WaveFormat(48000, 16, 1))
+            {
+                DiscardOnBufferOverflow = true
+            };
+
+            _wasapiOut = new WasapiOut(_selectedAudioDevice, AudioClientShareMode.Shared, useEventSync: true, latency: 40);
+            _wasapiOut.Init(_waveProvider);
+            _wasapiOut.Play();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Failed to setup WasapiOut: {ex.Message}");
+        }
+    }
+
+    private async Task StartAudioStreamAsync(Uri baseUri, CancellationToken ct, string? ffmpegPath)
+    {
+        if (string.IsNullOrEmpty(ffmpegPath)) return;
+        try
+        {
+            var audioUri = new UriBuilder(baseUri) { Path = "/audio.opus", Query = "", Fragment = "" }.Uri;
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+            var response = await _http.GetAsync(audioUri, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
+            if (!response.IsSuccessStatusCode) return;
+
+            await using var stream = await response.Content.ReadAsStreamAsync(ct);
+            await ReadOpusAudioAsync(stream, ct, ffmpegPath);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Audio stream error: {ex.Message}");
+        }
+        finally
+        {
+            await Dispatcher.InvokeAsync(() => AudioMeter.Value = 0);
+        }
+    }
+
+    private async Task ReadOpusAudioAsync(Stream networkStream, CancellationToken ct, string ffmpegPath)
+    {
+        var psi = new ProcessStartInfo(ffmpegPath)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        psi.ArgumentList.Add("-hide_banner");
+        psi.ArgumentList.Add("-nostats");
+        psi.ArgumentList.Add("-loglevel");
+        psi.ArgumentList.Add("error");
+        psi.ArgumentList.Add("-f");
+        psi.ArgumentList.Add("ogg");
+        psi.ArgumentList.Add("-i");
+        psi.ArgumentList.Add("pipe:0");
+        psi.ArgumentList.Add("-f");
+        psi.ArgumentList.Add("s16le");
+        psi.ArgumentList.Add("-ac");
+        psi.ArgumentList.Add("1");
+        psi.ArgumentList.Add("-ar");
+        psi.ArgumentList.Add("48000");
+        psi.ArgumentList.Add("pipe:1");
+
+        using var ffmpeg = Process.Start(psi);
+        if (ffmpeg is null) return;
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        var errorDrainTask = Task.Run(async () =>
+        {
+            var errBuf = new char[512];
+            try
+            {
+                while (!linkedCts.Token.IsCancellationRequested)
+                {
+                    var read = await ffmpeg.StandardError.ReadAsync(errBuf.AsMemory(0, errBuf.Length), linkedCts.Token);
+                    if (read <= 0) break;
+                }
+            }
+            catch { }
+        }, linkedCts.Token);
+
+        var feedTask = Task.Run(async () =>
+        {
+            var buf = new byte[4096];
+            try
+            {
+                while (!linkedCts.Token.IsCancellationRequested)
+                {
+                    var read = await networkStream.ReadAsync(buf.AsMemory(0, buf.Length), linkedCts.Token);
+                    if (read <= 0) break;
+                    await ffmpeg.StandardInput.BaseStream.WriteAsync(buf.AsMemory(0, read), linkedCts.Token);
+                    await ffmpeg.StandardInput.BaseStream.FlushAsync(linkedCts.Token);
+                }
+            }
+            catch { }
+            finally
+            {
+                try { ffmpeg.StandardInput.Close(); } catch { }
+            }
+        }, linkedCts.Token);
+
+        try
+        {
+            var pcmBuf = new byte[1920]; // 20ms of 48kHz mono 16-bit
+            var meterTick = 0;
+            while (!linkedCts.Token.IsCancellationRequested)
+            {
+                var totalRead = 0;
+                while (totalRead < pcmBuf.Length && !linkedCts.Token.IsCancellationRequested)
+                {
+                    var read = await ffmpeg.StandardOutput.BaseStream.ReadAsync(pcmBuf.AsMemory(totalRead, pcmBuf.Length - totalRead), linkedCts.Token);
+                    if (read <= 0) break;
+                    totalRead += read;
+                }
+                if (totalRead <= 0) break;
+
+                short peak = 0;
+                var vol = _audioVolume;
+                var muted = _micMuted;
+
+                for (var i = 0; i < totalRead; i += 2)
+                {
+                    if (muted)
+                    {
+                        pcmBuf[i] = 0;
+                        pcmBuf[i + 1] = 0;
+                    }
+                    else
+                    {
+                        var sample = (short)(pcmBuf[i] | (pcmBuf[i + 1] << 8));
+                        if (Math.Abs(vol - 1.0f) > 0.01f)
+                        {
+                            var scaled = (int)(sample * vol);
+                            if (scaled > 32767) scaled = 32767;
+                            else if (scaled < -32768) scaled = -32768;
+                            sample = (short)scaled;
+                            pcmBuf[i] = (byte)(sample & 0xFF);
+                            pcmBuf[i + 1] = (byte)((sample >> 8) & 0xFF);
+                        }
+                        var abs = Math.Abs(sample);
+                        if (abs > peak) peak = (short)abs;
+                    }
+                }
+
+                if (!muted)
+                {
+                    meterTick++;
+                    if (meterTick % 3 == 0)
+                    {
+                        var level = Math.Min(100.0, (peak / 32768.0) * 100.0 * 1.5);
+                        _ = Dispatcher.InvokeAsync(() => AudioMeter.Value = level);
+                    }
+                }
+                else
+                {
+                    _ = Dispatcher.InvokeAsync(() => AudioMeter.Value = 0);
+                }
+
+                _waveProvider?.AddSamples(pcmBuf, 0, totalRead);
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            try { linkedCts.Cancel(); } catch { }
+            try { ffmpeg.StandardInput.Close(); } catch { }
+            if (!ffmpeg.WaitForExit(1000))
+            {
+                try { ffmpeg.Kill(true); } catch { }
+            }
+        }
+    }
+
     protected override void OnClosed(EventArgs e)
     {
         _streamCancellation?.Cancel();
+        _audioCts?.Cancel();
+        _audioCts?.Dispose();
+        try { _wasapiOut?.Stop(); } catch { }
+        try { _wasapiOut?.Dispose(); } catch { }
+        try { _deviceEnumerator?.Dispose(); } catch { }
         _discoveryCts?.Cancel();
         try { _discoveryClient?.Close(); } catch { }
         if (_cameraHost is { HasExited: false })

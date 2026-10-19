@@ -41,6 +41,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows camera host restore failed.' }
 dotnet publish $cameraHost -c Release -r win-x64 --no-restore -p:Platform=x64 -o $windowsOutput
 if ($LASTEXITCODE -ne 0) { throw 'Windows camera host publish failed.' }
 Copy-Item (Join-Path $root 'scripts\install-camera.ps1') (Join-Path $windowsOutput 'install-camera.ps1') -Force
+Copy-Item (Join-Path $root 'scripts\install-microphone.ps1') (Join-Path $windowsOutput 'install-microphone.ps1') -Force
+if (Test-Path (Join-Path $root 'windows\vbcable')) {
+    Copy-Item (Join-Path $root 'windows\vbcable') (Join-Path $windowsOutput 'vbcable') -Recurse -Force
+}
 Copy-Item (Join-Path $root 'windows\CameraSource\VCamNetSample-LICENSE.txt') (Join-Path $windowsOutput 'PhonecamCameraSource-LICENSE.txt') -Force
 
 $classes = Join-Path $build 'classes'

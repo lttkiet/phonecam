@@ -73,6 +73,22 @@
         </Border>
         <Border Background="{StaticResource CardBg}" BorderBrush="{StaticResource CardBorder}" BorderThickness="1" CornerRadius="14" Padding="16" Margin="0,14,0,0">
           <StackPanel>
+            <TextBlock Text="Virtual microphone" FontSize="15" FontWeight="SemiBold" />
+            <TextBlock x:Name="MicDeviceText" Text="Checking virtual microphone driver..." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,8,0,0" />
+            <Button x:Name="InstallMicButton" Content="Install Virtual Microphone" Background="#263445" Foreground="{StaticResource Ink}" HorizontalAlignment="Left" Margin="0,12,0,0" Visibility="Collapsed" Click="InstallMicrophone_Click" />
+            <TextBlock Text="Audio output target" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,12,0,4" />
+            <ComboBox x:Name="AudioDeviceBox" SelectionChanged="AudioDeviceBox_SelectionChanged" Margin="0,0,0,10" />
+            <TextBlock Text="Live microphone level" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,0,0,4" />
+            <ProgressBar x:Name="AudioMeter" Height="8" Background="#16202A" Foreground="#00D2A0" BorderThickness="0" Minimum="0" Maximum="100" Value="0" Margin="0,0,0,10" />
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="MicMuteButton" Content="Mic: ON" Background="#263445" Foreground="{StaticResource Ink}" Padding="12,6" Click="MicMuteButton_Click" />
+              <TextBlock Text="Vol:" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,6,0" FontSize="12" />
+              <Slider x:Name="VolumeSlider" Width="100" Minimum="0" Maximum="1.5" Value="1.0" VerticalAlignment="Center" ValueChanged="VolumeSlider_ValueChanged" />
+            </StackPanel>
+          </StackPanel>
+        </Border>
+        <Border Background="{StaticResource CardBg}" BorderBrush="{StaticResource CardBorder}" BorderThickness="1" CornerRadius="14" Padding="16" Margin="0,14,0,0">
+          <StackPanel>
             <TextBlock Text="Phone camera settings" FontSize="15" FontWeight="SemiBold" />
             <TextBlock Text="Changes apply to the live phone camera." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,10" />
             <TextBlock Text="Camera" Foreground="{StaticResource Muted}" FontSize="12" />

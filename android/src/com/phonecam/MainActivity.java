@@ -26,6 +26,9 @@ import android.media.ImageReader;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
@@ -132,6 +135,20 @@ public final class MainActivity extends Activity {
     private ImageView qrImageView;
     private Thread discoveryThread;
 
+    // Audio recording & Opus encoder fields
+    private AudioRecord audioRecord;
+    private MediaCodec audioCodec;
+    private Thread audioFeedThread;
+    private Thread audioDrainThread;
+    private volatile boolean audioRunning = false;
+    private volatile boolean micMuted = false;
+    private Button micUiButton;
+    private final CopyOnWriteArrayList<Socket> opusClients = new CopyOnWriteArrayList<>();
+    private byte[] cachedOpusHeadPage;
+    private byte[] cachedOpusTagsPage;
+    private long oggGranulePos = 0;
+    private int oggPageSeq = 2;
+
     @Override public void onCreate(Bundle savedState) {
         super.onCreate(savedState);
         running = true;
@@ -139,9 +156,15 @@ public final class MainActivity extends Activity {
         acquireLocks();
         buildUi();
         refreshAddress();
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.CAMERA}, 1);
-        } else startCamera();
+        List<String> needed = new ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.CAMERA);
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) needed.add(Manifest.permission.RECORD_AUDIO);
+        if (!needed.isEmpty()) {
+            requestPermissions(needed.toArray(new String[0]), 1);
+        } else {
+            startCamera();
+            startAudio();
+        }
         startServer();
         startDiscoveryBroadcaster();
     }
@@ -295,6 +318,19 @@ public final class MainActivity extends Activity {
         qrParams.setMargins(8, 0, 0, 0);
         btnRow2.addView(qrButton, qrParams);
         root.addView(btnRow2, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout btnRow3 = new LinearLayout(this);
+        btnRow3.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow3.setGravity(Gravity.CENTER);
+        btnRow3.setPadding(0, 0, 0, 14);
+
+        micUiButton = new Button(this);
+        micUiButton.setText("MIC: ON");
+        styleModernButton(micUiButton, 0xff202d3d, 0xff00d2a0);
+        micUiButton.setOnClickListener(v -> toggleMic());
+        LinearLayout.LayoutParams micParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        btnRow3.addView(micUiButton, micParams);
+        root.addView(btnRow3, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
         viewfinder = new ImageView(this);
         viewfinder.setScaleType(ImageView.ScaleType.FIT_CENTER);
@@ -524,6 +560,14 @@ public final class MainActivity extends Activity {
         final boolean front;
         final boolean hasFlash;
         CameraChoice(String id, boolean front, boolean hasFlash) { this.id = id; this.front = front; this.hasFlash = hasFlash; }
+    }
+
+    private void toggleMic() {
+        micMuted = !micMuted;
+        if (micUiButton != null) {
+            micUiButton.setText(micMuted ? "MIC: MUTED" : "MIC: ON");
+            micUiButton.setTextColor(micMuted ? 0xffff5555 : 0xff00d2a0);
+        }
     }
 
     private void toggleTorch() {
@@ -761,8 +805,16 @@ public final class MainActivity extends Activity {
 
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
-        if (request == 1 && results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) startCamera();
-        else state.setText("Camera permission is required");
+        if (request == 1) {
+            if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                startCamera();
+            } else {
+                state.setText("Camera permission is required");
+            }
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                startAudio();
+            }
+        }
     }
 
     private void startCamera() {
@@ -1018,6 +1070,229 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private static final int[] CRC_LOOKUP = new int[256];
+    static {
+        for (int i = 0; i < 256; i++) {
+            int r = i << 24;
+            for (int j = 0; j < 8; j++) {
+                if ((r & 0x80000000) != 0) {
+                    r = (r << 1) ^ 0x04c11db7;
+                } else {
+                    r <<= 1;
+                }
+            }
+            CRC_LOOKUP[i] = r;
+        }
+    }
+
+    private static int computeOggCrc(byte[] data, int offset, int length) {
+        int crc = 0;
+        for (int i = 0; i < length; i++) {
+            crc = (crc << 8) ^ CRC_LOOKUP[((crc >>> 24) ^ (data[offset + i] & 0xff)) & 0xff];
+        }
+        return crc;
+    }
+
+    private static byte[] makeOggPage(byte[] payload, int headerType, long granulePos, int pageSeq) {
+        int segCount = (payload.length / 255) + 1;
+        byte[] page = new byte[27 + segCount + payload.length];
+        page[0] = 'O'; page[1] = 'g'; page[2] = 'g'; page[3] = 'S';
+        page[4] = 0;
+        page[5] = (byte) headerType;
+        for (int i = 0; i < 8; i++) page[6 + i] = (byte) ((granulePos >>> (8 * i)) & 0xff);
+        page[14] = 0x01; page[15] = 0x02; page[16] = 0x03; page[17] = 0x04;
+        for (int i = 0; i < 4; i++) page[18 + i] = (byte) ((pageSeq >>> (8 * i)) & 0xff);
+        page[22] = 0; page[23] = 0; page[24] = 0; page[25] = 0;
+        page[26] = (byte) segCount;
+        int remaining = payload.length;
+        for (int i = 0; i < segCount; i++) {
+            if (remaining >= 255) {
+                page[27 + i] = (byte) 255;
+                remaining -= 255;
+            } else {
+                page[27 + i] = (byte) remaining;
+                remaining = 0;
+            }
+        }
+        System.arraycopy(payload, 0, page, 27 + segCount, payload.length);
+        int crc = computeOggCrc(page, 0, page.length);
+        page[22] = (byte) (crc & 0xff);
+        page[23] = (byte) ((crc >>> 8) & 0xff);
+        page[24] = (byte) ((crc >>> 16) & 0xff);
+        page[25] = (byte) ((crc >>> 24) & 0xff);
+        return page;
+    }
+
+    private synchronized void initOpusHeaders() {
+        if (cachedOpusHeadPage != null) return;
+        byte[] opusHead = new byte[19];
+        byte[] magicHead = "OpusHead".getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(magicHead, 0, opusHead, 0, 8);
+        opusHead[8] = 1;
+        opusHead[9] = 1; // 1 channel
+        opusHead[10] = 0x38; opusHead[11] = 0x01; // pre-skip = 312
+        opusHead[12] = (byte) 0x80; opusHead[13] = (byte) 0xBB; opusHead[14] = 0x00; opusHead[15] = 0x00; // 48000 Hz
+        opusHead[16] = 0; opusHead[17] = 0;
+        opusHead[18] = 0;
+        cachedOpusHeadPage = makeOggPage(opusHead, 0x02, 0, 0);
+
+        byte[] opusTags = new byte[24];
+        byte[] magicTags = "OpusTags".getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(magicTags, 0, opusTags, 0, 8);
+        opusTags[8] = 8; opusTags[9] = 0; opusTags[10] = 0; opusTags[11] = 0;
+        byte[] vendor = "Phonecam".getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(vendor, 0, opusTags, 12, 8);
+        opusTags[20] = 0; opusTags[21] = 0; opusTags[22] = 0; opusTags[23] = 0;
+        cachedOpusTagsPage = makeOggPage(opusTags, 0x00, 0, 1);
+    }
+
+    private synchronized void startAudio() {
+        if (audioRunning) return;
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return;
+        initOpusHeaders();
+        try {
+            int minBuf = AudioRecord.getMinBufferSize(48000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+            audioRecord = new AudioRecord(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                48000,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                Math.max(minBuf, 1920 * 4)
+            );
+            if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                Log.w("Phonecam", "AudioRecord failed to initialize with VOICE_COMMUNICATION, falling back to MIC");
+                audioRecord = new AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    48000,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    Math.max(minBuf, 1920 * 4)
+                );
+            }
+            if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                Log.e("Phonecam", "Failed to initialize AudioRecord");
+                return;
+            }
+
+            MediaFormat format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, 48000, 1);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 64000);
+            format.setInteger(MediaFormat.KEY_COMPLEXITY, 5);
+            audioCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS);
+            audioCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            audioCodec.start();
+            audioRecord.startRecording();
+            audioRunning = true;
+            oggGranulePos = 0;
+            oggPageSeq = 2;
+
+            audioFeedThread = new Thread(this::feedAudioEncoder, "phonecam-audio-feed");
+            audioFeedThread.setDaemon(true);
+            audioFeedThread.start();
+
+            audioDrainThread = new Thread(this::drainAudioEncoder, "phonecam-audio-drain");
+            audioDrainThread.setDaemon(true);
+            audioDrainThread.start();
+            Log.i("Phonecam", "Opus audio pipeline started successfully");
+        } catch (Exception e) {
+            Log.e("Phonecam", "Failed to start audio pipeline", e);
+            stopAudio();
+        }
+    }
+
+    private void feedAudioEncoder() {
+        byte[] pcmBuf = new byte[1920]; // 20ms @ 48kHz 16-bit mono = 960 samples * 2
+        long pts = 0;
+        while (audioRunning) {
+            int read = 0;
+            try {
+                if (audioRecord == null) break;
+                read = audioRecord.read(pcmBuf, 0, pcmBuf.length);
+            } catch (Exception e) {
+                break;
+            }
+            if (read <= 0) continue;
+            if (micMuted) {
+                Arrays.fill(pcmBuf, (byte) 0);
+            }
+            try {
+                int inIdx = audioCodec.dequeueInputBuffer(10000);
+                if (inIdx >= 0) {
+                    ByteBuffer inputBuffer = audioCodec.getInputBuffer(inIdx);
+                    if (inputBuffer != null) {
+                        inputBuffer.clear();
+                        inputBuffer.put(pcmBuf, 0, read);
+                        audioCodec.queueInputBuffer(inIdx, 0, read, pts, 0);
+                        pts += 20000; // 20ms in microseconds
+                    }
+                }
+            } catch (Exception e) {
+                if (!audioRunning) break;
+            }
+        }
+    }
+
+    private void drainAudioEncoder() {
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        byte[] opusBuf = new byte[4096];
+        while (audioRunning) {
+            try {
+                int outIdx = audioCodec.dequeueOutputBuffer(info, 10000);
+                if (outIdx >= 0) {
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && info.size > 0) {
+                        ByteBuffer outBuffer = audioCodec.getOutputBuffer(outIdx);
+                        if (outBuffer != null) {
+                            outBuffer.position(info.offset);
+                            outBuffer.limit(info.offset + info.size);
+                            if (info.size > opusBuf.length) opusBuf = new byte[info.size];
+                            outBuffer.get(opusBuf, 0, info.size);
+
+                            byte[] payload = new byte[info.size];
+                            System.arraycopy(opusBuf, 0, payload, 0, info.size);
+                            oggGranulePos += 960; // 20ms = 960 samples
+                            byte[] oggPage = makeOggPage(payload, 0x00, oggGranulePos, oggPageSeq++);
+                            broadcastOpusPage(oggPage);
+                        }
+                    }
+                    audioCodec.releaseOutputBuffer(outIdx, false);
+                }
+            } catch (Exception e) {
+                if (!audioRunning) break;
+            }
+        }
+    }
+
+    private void broadcastOpusPage(byte[] page) {
+        if (opusClients.isEmpty()) return;
+        for (Socket client : opusClients) {
+            try {
+                OutputStream out = client.getOutputStream();
+                out.write(page);
+                out.flush();
+            } catch (Exception e) {
+                try { client.close(); } catch (Exception ignored) {}
+                opusClients.remove(client);
+            }
+        }
+    }
+
+    private synchronized void stopAudio() {
+        audioRunning = false;
+        try {
+            if (audioRecord != null) {
+                audioRecord.stop();
+                audioRecord.release();
+            }
+        } catch (Exception ignored) {}
+        audioRecord = null;
+        try {
+            if (audioCodec != null) {
+                audioCodec.stop();
+                audioCodec.release();
+            }
+        } catch (Exception ignored) {}
+        audioCodec = null;
+    }
+
     private void rotateNv21(byte[] src, byte[] dst, int width, int height, int rotation) {
         if (rotation == 90) {
             int i = 0;
@@ -1176,6 +1451,34 @@ public final class MainActivity extends Activity {
                 if (body.length != length) { writeJson(out, "400 Bad Request", "{}"); return; }
                 JSONObject requested = new JSONObject(new String(body, StandardCharsets.UTF_8));
                 writeJson(out, "200 OK", onUi(() -> applyRemoteSettings(requested)));
+                return;
+            }
+            if ("GET".equals(method) && ("/audio.opus".equals(path) || "/audio.ogg".equals(path) || "/stream.opus".equals(path))) {
+                startAudio();
+                out.write(("HTTP/1.1 200 OK\r\n" +
+                           "Access-Control-Allow-Origin: *\r\n" +
+                           "Cache-Control: no-store\r\n" +
+                           "Connection: keep-alive\r\n" +
+                           "Content-Type: audio/ogg; codecs=opus\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                if (cachedOpusHeadPage != null) {
+                    try {
+                        out.write(cachedOpusHeadPage);
+                        out.write(cachedOpusTagsPage);
+                        out.flush();
+                    } catch (Exception ignored) {}
+                }
+                opusClients.add(client);
+                InputStream inStream = client.getInputStream();
+                byte[] discard = new byte[512];
+                while (!client.isClosed() && running) {
+                    try {
+                        int r = inStream.read(discard);
+                        if (r < 0) break;
+                    } catch (Exception e) { break; }
+                }
+                opusClients.remove(client);
+                try { client.close(); } catch (Exception ignored) {}
                 return;
             }
             if ("GET".equals(method) && ("/stream.h264".equals(path) || "/h264".equals(path))) {
@@ -1354,6 +1657,8 @@ public final class MainActivity extends Activity {
         json.put("fpsMin", selectedFpsRange.getLower()); json.put("fpsMax", selectedFpsRange.getUpper()); json.put("quality", jpegQuality);
         json.put("hasTorch", selectedCamera != null && selectedCamera.hasFlash);
         json.put("torch", torchActive);
+        json.put("hasMic", checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED);
+        json.put("micMuted", micMuted);
         return json.toString();
     }
 
@@ -1376,6 +1681,14 @@ public final class MainActivity extends Activity {
             torchActive = requested.optBoolean("torch", false);
         } else if (cameraChanged && (selectedCamera == null || !selectedCamera.hasFlash)) {
             torchActive = false;
+        }
+
+        if (requested.has("micMuted")) {
+            micMuted = requested.optBoolean("micMuted", false);
+            if (micUiButton != null) {
+                micUiButton.setText(micMuted ? "MIC: MUTED" : "MIC: ON");
+                micUiButton.setTextColor(micMuted ? 0xffff5555 : 0xff00d2a0);
+            }
         }
 
         cameraSelection = cameraChoices.indexOf(selectedCamera);
@@ -1436,6 +1749,8 @@ public final class MainActivity extends Activity {
         for (Socket client : clients) try { client.close(); } catch (IOException ignored) {}
         for (Socket client : h264Clients) try { client.close(); } catch (IOException ignored) {}
         for (Socket client : mjpgClients) try { client.close(); } catch (IOException ignored) {}
+        stopAudio();
+        for (Socket client : opusClients) try { client.close(); } catch (IOException ignored) {}
         super.onDestroy();
     }
 }

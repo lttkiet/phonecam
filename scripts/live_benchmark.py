@@ -6,19 +6,25 @@ import statistics
 import os
 import sys
 
+ADB_BIN = r"C:\platform-tools\adb.exe" if os.path.exists(r"C:\platform-tools\adb.exe") else "adb"
+
 def get_adb_pid():
     try:
-        res = subprocess.run(["adb", "shell", "pidof", "com.phonecam"], capture_output=True, text=True, timeout=5)
-        pids = res.stdout.strip().split()
-        return pids[0] if pids else None
+        res = subprocess.run([ADB_BIN, "shell", "ps"], capture_output=True, text=True, timeout=15)
+        for line in res.stdout.splitlines():
+            if "com.phonecam" in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    return parts[1]
     except Exception:
-        return None
+        pass
+    return None
 
 def get_phone_cpu(pid):
     if not pid:
         return "N/A"
     try:
-        res = subprocess.run(["adb", "shell", "top", "-b", "-n", "1", "-p", pid], capture_output=True, text=True, timeout=5)
+        res = subprocess.run([ADB_BIN, "shell", "top", "-b", "-n", "1", "-p", pid], capture_output=True, text=True, timeout=15)
         for line in res.stdout.splitlines():
             if pid in line and "phonecam" in line:
                 parts = line.split()
@@ -33,7 +39,7 @@ def get_phone_cpu(pid):
 
 def get_phone_dumpsys():
     try:
-        res = subprocess.run(["adb", "shell", "dumpsys", "cpuinfo"], capture_output=True, text=True, timeout=5)
+        res = subprocess.run([ADB_BIN, "shell", "dumpsys", "cpuinfo"], capture_output=True, text=True, timeout=15)
         for line in res.stdout.splitlines():
             if "phonecam" in line:
                 return line.strip()
@@ -185,11 +191,49 @@ def run_ffmpeg_decoder_benchmark():
     except Exception as e:
         return {"error": str(e)}
 
+def run_audio_benchmark(duration=4.0):
+    url = "http://127.0.0.1:18765/audio.opus"
+    req = urllib.request.Request(url)
+    print(f"\n=== 3. RUNNING LIVE OPUS AUDIO STREAM BENCHMARK ({url}) ===")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            print(f"Content-Type : {content_type}")
+            start = time.time()
+            total_bytes = 0
+            page_count = 0
+            while time.time() - start < duration:
+                chunk = resp.read(1024)
+                if not chunk: break
+                total_bytes += len(chunk)
+                page_count += chunk.count(b"OggS")
+            elapsed = time.time() - start
+            bitrate_kbps = (total_bytes * 8.0) / (elapsed * 1000.0) if elapsed > 0 else 0
+            print(f"Audio Stream : {total_bytes} bytes in {elapsed:.2f}s ({bitrate_kbps:.1f} kbps, {page_count} Ogg pages)")
+            return {
+                "success": True,
+                "content_type": content_type,
+                "duration_sec": elapsed,
+                "total_bytes": total_bytes,
+                "ogg_pages": page_count,
+                "bitrate_kbps": bitrate_kbps
+            }
+    except Exception as e:
+        print(f"Audio Error  : {e}")
+        return {"success": False, "error": str(e)}
+
 def main():
     print("====================================================")
     print("    PHONECAM LIVE HARDWARE PIPELINE BENCHMARK")
     print("====================================================")
-    
+
+    try:
+        fwd = subprocess.run([ADB_BIN, "forward", "tcp:18765", "tcp:8765"], capture_output=True, text=True, timeout=15)
+        print("ADB forward:", fwd.stdout.strip(), fwd.stderr.strip())
+        time.sleep(1.0)
+    except Exception as e:
+        print("ADB forward failed:", e)
+
     pid = get_adb_pid()
     print(f"Device Android PID: {pid}")
     
@@ -203,7 +247,9 @@ def main():
     
     ffmpeg_res = run_ffmpeg_decoder_benchmark()
     print(f"FFmpeg Decoded Output: {ffmpeg_res.get('details')}")
-    
+
+    audio_res = run_audio_benchmark(4.0)
+
     print("\n====================================================")
     print("                 BENCHMARK RESULTS")
     print("====================================================")
@@ -217,11 +263,12 @@ def main():
     print(f"Average Frame Delta  : {stream_res['mean_interval_ms']:.2f} ms (ideal: 33.33 ms)")
     print(f"Frame Jitter (StdDev): {stream_res['jitter_stdev_ms']:.2f} ms")
     print(f"Min / Max Interval   : {stream_res['min_interval_ms']:.1f} ms / {stream_res['max_interval_ms']:.1f} ms")
+    print(f"Opus Audio Bitrate   : {audio_res.get('bitrate_kbps', 0):.1f} kbps ({audio_res.get('ogg_pages', 0)} Ogg pages)")
     print(f"Phone CPU Usage      : {cpu_info}")
     print("====================================================")
-    
+
     with open("artifacts/benchmark_report.json", "w") as f:
-        json.dump({"stream": stream_res, "ffmpeg": ffmpeg_res, "phone_cpu": cpu_info}, f, indent=2)
+        json.dump({"stream": stream_res, "audio": audio_res, "ffmpeg": ffmpeg_res, "phone_cpu": cpu_info}, f, indent=2)
     print("Full report saved to artifacts/benchmark_report.json")
 
 if __name__ == "__main__":
