@@ -396,6 +396,13 @@ public final class MainActivity extends Activity {
                 cameraSelection = position;
                 selectedCamera = cameraChoices.get(position);
                 front = selectedCamera.front;
+                zoomRatio = 1.0f;
+                aeCompensation = 0;
+                aeLocked = false;
+                awbMode = 1;
+                awbLocked = false;
+                manualFocus = false;
+                focusDistance = 0.0f;
                 getPreferences(MODE_PRIVATE).edit().putBoolean("front", front).putString("cameraId", selectedCamera.id).apply();
                 refreshCameraControls();
                 startCamera();
@@ -633,11 +640,15 @@ public final class MainActivity extends Activity {
     }
 
     private void applyCaptureParameters(CaptureRequest.Builder builder) {
+        // Enforce Auto 3A mode
+        builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+
         // Zoom
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && maxZoom > 1.0f) {
             builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio);
         }
-        // Exposure compensation & AE lock
+        // Exposure compensation & AE mode/lock
+        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
         builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeCompensation);
         builder.set(CaptureRequest.CONTROL_AE_LOCK, aeLocked);
         // White balance
@@ -2127,6 +2138,15 @@ public final class MainActivity extends Activity {
         boolean cameraChanged = !cameraId.equals(selectedCamera.id);
         selectedCamera = cameraChoices.stream().filter(choice -> choice.id.equals(cameraId)).findFirst().orElse(selectedCamera);
         front = selectedCamera.front;
+        if (cameraChanged) {
+            zoomRatio = 1.0f;
+            aeCompensation = 0;
+            aeLocked = false;
+            awbMode = 1;
+            awbLocked = false;
+            manualFocus = false;
+            focusDistance = 0.0f;
+        }
         refreshCameraControls();
         Size wantedSize = new Size(requested.optInt("width", selectedSize.getWidth()), requested.optInt("height", selectedSize.getHeight()));
         boolean sizeChanged = !wantedSize.equals(selectedSize);
@@ -2223,6 +2243,13 @@ public final class MainActivity extends Activity {
             try { encoderSurface.release(); } catch (Exception ignored) {}
             encoderSurface = null;
         }
+        synchronized (codecLock) {
+            codecConfigHeader = null;
+        }
+        for (Socket s : h264Clients) {
+            try { s.close(); } catch (Exception ignored) {}
+        }
+        h264Clients.clear();
         if (cameraThread != null) {
             cameraThread.quitSafely();
             try {
