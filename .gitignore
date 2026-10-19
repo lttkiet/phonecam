@@ -1,10 +1,22 @@
-.dotnet-home/
-.nuget/
-**/bin/
-**/obj/
+# Build output & artifacts
+artifacts/
 android/build/
 android/out/
-artifacts/
-artifacts/*.keystore
-phonecam-live-test.png
+**/bin/
+**/obj/
+.dotnet-home/
+.nuget/
+
+# Keystores & sensitive credentials
+*.keystore
+
+# Test captures and temporary bitstreams
 *.h264
+*.png
+*.mp4
+
+# IDE & OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
