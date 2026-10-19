@@ -56,7 +56,7 @@
           </Border>
         </Grid>
       </Border>
-      <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,8,0">
+      <ScrollViewer x:Name="SidebarScrollViewer" Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,8,0">
       <StackPanel>
         <Border x:Name="DiscoveredPanel" Background="#1D2E2B" BorderBrush="#2C5248" BorderThickness="1" CornerRadius="12" Padding="12,10" Margin="0,0,0,14" Visibility="Collapsed">
           <StackPanel>
@@ -117,6 +117,64 @@
               <Button x:Name="TorchButton" Content="Torch: Off" Background="#263445" Foreground="{StaticResource Ink}" Padding="12,6" Margin="16,0,0,0" IsEnabled="False" Click="TorchButton_Click" />
             </StackPanel>
             <TextBlock x:Name="SettingsStatusText" Text="Connect to a phone to change settings." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,10,0,0" />
+          </StackPanel>
+        </Border>
+        <Border Background="{StaticResource CardBg}" BorderBrush="{StaticResource CardBorder}" BorderThickness="1" CornerRadius="14" Padding="16" Margin="0,14,0,0">
+          <StackPanel>
+            <TextBlock Text="Manual camera controls" FontSize="15" FontWeight="SemiBold" />
+            <TextBlock Text="Fine-tune framing, exposure, color, and focus." Foreground="{StaticResource Muted}" FontSize="12" Margin="0,2,0,10" />
+
+            <!-- Zoom Control -->
+            <DockPanel Margin="0,0,0,4">
+              <TextBlock Text="Zoom" Foreground="{StaticResource Muted}" FontSize="12" />
+              <TextBlock x:Name="ZoomValueText" Text="1.0x" Foreground="#00D2A0" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Right" />
+            </DockPanel>
+            <Slider x:Name="ZoomSlider" Minimum="1.0" Maximum="4.0" Value="1.0" SmallChange="0.1" LargeChange="0.5" IsEnabled="False" ValueChanged="ManualControl_Changed" Margin="0,0,0,10" />
+
+            <!-- Exposure Compensation (EV) & Lock -->
+            <DockPanel Margin="0,0,0,4">
+              <TextBlock Text="Exposure (EV)" Foreground="{StaticResource Muted}" FontSize="12" />
+              <TextBlock x:Name="EvValueText" Text="0.0 EV" Foreground="#00D2A0" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Right" />
+            </DockPanel>
+            <Grid Margin="0,0,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <Slider x:Name="EvSlider" Minimum="-2.0" Maximum="2.0" Value="0.0" SmallChange="0.1" IsEnabled="False" ValueChanged="ManualControl_Changed" VerticalAlignment="Center" />
+              <Button x:Name="AeLockButton" Grid.Column="1" Content="Lock AE" Background="#263445" Foreground="{StaticResource Ink}" Padding="8,4" Margin="8,0,0,0" IsEnabled="False" Click="AeLockButton_Click" />
+            </Grid>
+
+            <!-- White Balance -->
+            <DockPanel Margin="0,0,0,4">
+              <TextBlock Text="White balance" Foreground="{StaticResource Muted}" FontSize="12" />
+            </DockPanel>
+            <Grid Margin="0,0,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <ComboBox x:Name="AwbModeBox" IsEnabled="False" SelectionChanged="AwbModeBox_SelectionChanged">
+                <ComboBoxItem Content="Auto" Tag="1" IsSelected="True" />
+                <ComboBoxItem Content="Daylight" Tag="5" />
+                <ComboBoxItem Content="Cloudy" Tag="6" />
+                <ComboBoxItem Content="Fluorescent" Tag="3" />
+                <ComboBoxItem Content="Incandescent" Tag="2" />
+              </ComboBox>
+              <Button x:Name="AwbLockButton" Grid.Column="1" Content="Lock AWB" Background="#263445" Foreground="{StaticResource Ink}" Padding="8,4" Margin="8,0,0,0" IsEnabled="False" Click="AwbLockButton_Click" />
+            </Grid>
+
+            <!-- Focus Control -->
+            <DockPanel Margin="0,0,0,4">
+              <TextBlock Text="Focus" Foreground="{StaticResource Muted}" FontSize="12" />
+              <TextBlock x:Name="FocusValueText" Text="Auto (Continuous)" Foreground="#00D2A0" FontSize="12" FontWeight="SemiBold" HorizontalAlignment="Right" />
+            </DockPanel>
+            <CheckBox x:Name="ManualFocusCheck" Content="Manual Focus" Foreground="{StaticResource Ink}" IsEnabled="False" Margin="0,0,0,6" Click="ManualFocusCheck_Click" />
+            <Slider x:Name="FocusSlider" Minimum="0.0" Maximum="10.0" Value="0.0" IsEnabled="False" ValueChanged="ManualControl_Changed" Margin="0,0,0,4" />
+            <DockPanel Margin="0,0,0,4">
+              <TextBlock Text="Infinity (Far)" Foreground="{StaticResource Muted}" FontSize="10" />
+              <TextBlock Text="Macro (Near)" Foreground="{StaticResource Muted}" FontSize="10" HorizontalAlignment="Right" />
+            </DockPanel>
           </StackPanel>
         </Border>
         <TextBlock Text="USB connection" FontSize="15" FontWeight="SemiBold" Margin="0,20,0,0" />

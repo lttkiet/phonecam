@@ -70,6 +70,22 @@ public partial class MainWindow : Window
     private volatile float _audioVolume = 1.0f;
     private CancellationTokenSource? _audioCts;
 
+    // Manual camera control fields
+    private double _zoomRatio = 1.0;
+    private double _minZoom = 1.0;
+    private double _maxZoom = 4.0;
+    private int _aeComp = 0;
+    private int _minAeComp = -2;
+    private int _maxAeComp = 2;
+    private double _aeStep = 0.1666;
+    private bool _aeLocked = false;
+    private int _awbMode = 1;
+    private bool _awbLocked = false;
+    private bool _manualFocus = false;
+    private double _focusDistance = 0.0;
+    private double _maxFocusDistance = 10.0;
+    private CancellationTokenSource? _manualDebounce;
+
     private sealed record CameraOption(string Id, string Label);
     private sealed record SizeOption(int Width, int Height, string Label);
     private sealed record FpsOption(int Min, int Max, string Label);
@@ -124,6 +140,8 @@ public partial class MainWindow : Window
                     var height = (int)ActualHeight;
                     if (width <= 0) width = 1050;
                     if (height <= 0) height = 860;
+                    SidebarScrollViewer.ScrollToBottom();
+                    await Task.Delay(200);
                     var rtb = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
                     rtb.Render(this);
                     var encoder = new PngBitmapEncoder();
@@ -496,6 +514,76 @@ public partial class MainWindow : Window
             MicMuteButton.Background = _micMuted ? new SolidColorBrush(Color.FromRgb(180, 50, 50)) : new SolidColorBrush(Color.FromRgb(38, 52, 69));
         }
 
+        // Parse manual controls
+        if (root.TryGetProperty("minZoom", out var minZ) && root.TryGetProperty("maxZoom", out var maxZ))
+        {
+            _minZoom = minZ.GetDouble();
+            _maxZoom = maxZ.GetDouble();
+            ZoomSlider.Minimum = _minZoom;
+            ZoomSlider.Maximum = _maxZoom;
+            ZoomSlider.IsEnabled = _maxZoom > _minZoom;
+        }
+        if (root.TryGetProperty("zoom", out var zProp))
+        {
+            _zoomRatio = zProp.GetDouble();
+            ZoomSlider.Value = _zoomRatio;
+            ZoomValueText.Text = $"{_zoomRatio:0.0}x";
+        }
+        if (root.TryGetProperty("minAeComp", out var minAe) && root.TryGetProperty("maxAeComp", out var maxAe) && root.TryGetProperty("aeStep", out var aeStepProp))
+        {
+            _minAeComp = minAe.GetInt32();
+            _maxAeComp = maxAe.GetInt32();
+            _aeStep = aeStepProp.GetDouble();
+            EvSlider.Minimum = _minAeComp * _aeStep;
+            EvSlider.Maximum = _maxAeComp * _aeStep;
+            EvSlider.IsEnabled = _maxAeComp > _minAeComp;
+        }
+        if (root.TryGetProperty("aeComp", out var compProp))
+        {
+            _aeComp = compProp.GetInt32();
+            var evVal = _aeComp * _aeStep;
+            EvSlider.Value = evVal;
+            EvValueText.Text = $"{(evVal >= 0 ? "+" : "")}{evVal:0.0} EV";
+        }
+        if (root.TryGetProperty("aeLocked", out var aelProp))
+        {
+            _aeLocked = aelProp.GetBoolean();
+            AeLockButton.Content = _aeLocked ? "AE: Locked" : "Lock AE";
+            AeLockButton.Background = _aeLocked ? new SolidColorBrush(Color.FromRgb(180, 120, 20)) : new SolidColorBrush(Color.FromRgb(38, 52, 69));
+            AeLockButton.IsEnabled = true;
+        }
+        if (root.TryGetProperty("awbMode", out var awbProp))
+        {
+            _awbMode = awbProp.GetInt32();
+            AwbModeBox.SelectedItem = AwbModeBox.Items.OfType<System.Windows.Controls.ComboBoxItem>().FirstOrDefault(item => (string?)item.Tag == _awbMode.ToString()) ?? AwbModeBox.Items[0];
+            AwbModeBox.IsEnabled = true;
+        }
+        if (root.TryGetProperty("awbLocked", out var awblProp))
+        {
+            _awbLocked = awblProp.GetBoolean();
+            AwbLockButton.Content = _awbLocked ? "AWB: Locked" : "Lock AWB";
+            AwbLockButton.Background = _awbLocked ? new SolidColorBrush(Color.FromRgb(180, 120, 20)) : new SolidColorBrush(Color.FromRgb(38, 52, 69));
+            AwbLockButton.IsEnabled = true;
+        }
+        if (root.TryGetProperty("maxFocusDistance", out var maxFdProp))
+        {
+            _maxFocusDistance = maxFdProp.GetDouble();
+            FocusSlider.Maximum = _maxFocusDistance;
+        }
+        if (root.TryGetProperty("manualFocus", out var mfProp))
+        {
+            _manualFocus = mfProp.GetBoolean();
+            ManualFocusCheck.IsChecked = _manualFocus;
+            ManualFocusCheck.IsEnabled = _maxFocusDistance > 0;
+            FocusSlider.IsEnabled = _manualFocus && _maxFocusDistance > 0;
+        }
+        if (root.TryGetProperty("focusDistance", out var fdProp))
+        {
+            _focusDistance = fdProp.GetDouble();
+            FocusSlider.Value = _focusDistance;
+            FocusValueText.Text = _manualFocus ? $"{_focusDistance:0.1} dpt" : "Auto (Continuous)";
+        }
+
         _updatingPhoneSettings = false;
         SetSettingsEnabled(cameras.Length > 0 && sizes.Length > 0 && fps.Length > 0);
         SettingsStatusText.Text = "Settings apply to the live phone camera.";
@@ -508,6 +596,13 @@ public partial class MainWindow : Window
         FrameRateSettingsBox.IsEnabled = enabled;
         QualitySettingsBox.IsEnabled = enabled;
         TorchButton.IsEnabled = enabled && _hasTorch;
+        ZoomSlider.IsEnabled = enabled && _maxZoom > _minZoom;
+        EvSlider.IsEnabled = enabled && _maxAeComp > _minAeComp;
+        AeLockButton.IsEnabled = enabled;
+        AwbModeBox.IsEnabled = enabled;
+        AwbLockButton.IsEnabled = enabled;
+        ManualFocusCheck.IsEnabled = enabled && _maxFocusDistance > 0;
+        FocusSlider.IsEnabled = enabled && _manualFocus && _maxFocusDistance > 0;
     }
 
     private async void CameraSettings_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
@@ -579,6 +674,117 @@ public partial class MainWindow : Window
     {
         _mirrorVideo = MirrorBox.IsChecked == true;
         _reconnectNeeded = true;
+    }
+
+    private void ManualControl_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_updatingPhoneSettings || _settingsUri is null) return;
+        if (ReferenceEquals(sender, ZoomSlider))
+        {
+            _zoomRatio = ZoomSlider.Value;
+            ZoomValueText.Text = $"{_zoomRatio:0.0}x";
+        }
+        else if (ReferenceEquals(sender, EvSlider))
+        {
+            if (_aeStep > 0)
+            {
+                _aeComp = (int)Math.Round(EvSlider.Value / _aeStep);
+                _aeComp = Math.Clamp(_aeComp, _minAeComp, _maxAeComp);
+                var evVal = _aeComp * _aeStep;
+                EvValueText.Text = $"{(evVal >= 0 ? "+" : "")}{evVal:0.0} EV";
+            }
+        }
+        else if (ReferenceEquals(sender, FocusSlider))
+        {
+            _focusDistance = FocusSlider.Value;
+            if (_manualFocus) FocusValueText.Text = $"{_focusDistance:0.1} dpt";
+        }
+        ScheduleManualSettingsUpdate();
+    }
+
+    private void AeLockButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_settingsUri is null) return;
+        _aeLocked = !_aeLocked;
+        AeLockButton.Content = _aeLocked ? "AE: Locked" : "Lock AE";
+        AeLockButton.Background = _aeLocked ? new SolidColorBrush(Color.FromRgb(180, 120, 20)) : new SolidColorBrush(Color.FromRgb(38, 52, 69));
+        ScheduleManualSettingsUpdate();
+    }
+
+    private void AwbLockButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_settingsUri is null) return;
+        _awbLocked = !_awbLocked;
+        AwbLockButton.Content = _awbLocked ? "AWB: Locked" : "Lock AWB";
+        AwbLockButton.Background = _awbLocked ? new SolidColorBrush(Color.FromRgb(180, 120, 20)) : new SolidColorBrush(Color.FromRgb(38, 52, 69));
+        ScheduleManualSettingsUpdate();
+    }
+
+    private void AwbModeBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_updatingPhoneSettings || _settingsUri is null) return;
+        if (AwbModeBox.SelectedItem is System.Windows.Controls.ComboBoxItem item && int.TryParse((string?)item.Tag, out var mode))
+        {
+            _awbMode = mode;
+            ScheduleManualSettingsUpdate();
+        }
+    }
+
+    private void ManualFocusCheck_Click(object sender, RoutedEventArgs e)
+    {
+        if (_settingsUri is null) return;
+        _manualFocus = ManualFocusCheck.IsChecked == true;
+        FocusSlider.IsEnabled = _manualFocus && _maxFocusDistance > 0;
+        FocusValueText.Text = _manualFocus ? $"{_focusDistance:0.1} dpt" : "Auto (Continuous)";
+        ScheduleManualSettingsUpdate();
+    }
+
+    private void ScheduleManualSettingsUpdate()
+    {
+        if (_settingsUri is null) return;
+        _manualDebounce?.Cancel();
+        _manualDebounce?.Dispose();
+        _manualDebounce = new CancellationTokenSource();
+        var token = _manualDebounce.Token;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(100, token);
+                await _settingsUpdate.WaitAsync(token);
+                try
+                {
+                    var payload = JsonSerializer.Serialize(new
+                    {
+                        zoom = _zoomRatio,
+                        aeComp = _aeComp,
+                        aeLocked = _aeLocked,
+                        awbMode = _awbMode,
+                        awbLocked = _awbLocked,
+                        manualFocus = _manualFocus,
+                        focusDistance = _focusDistance
+                    });
+                    using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(3));
+                    using var response = await _http.PostAsync(_settingsUri, content, timeout.Token);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var json = await response.Content.ReadAsStringAsync(timeout.Token);
+                        await Dispatcher.InvokeAsync(() => ApplyPhoneSettingsJson(json));
+                    }
+                }
+                finally
+                {
+                    _settingsUpdate.Release();
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to send manual camera controls: {ex.Message}");
+            }
+        }, token);
     }
 
     private async void AutoDetectUsb_Click(object sender, RoutedEventArgs e)

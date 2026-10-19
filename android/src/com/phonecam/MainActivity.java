@@ -46,6 +46,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ArrayAdapter;
+import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.TextView;
 import java.io.ByteArrayOutputStream;
@@ -153,6 +154,27 @@ public final class MainActivity extends Activity {
     private long oggGranulePos = 0;
     private int oggPageSeq = 2;
 
+    // Manual camera control fields
+    private volatile float zoomRatio = 1.0f;
+    private float minZoom = 1.0f;
+    private float maxZoom = 1.0f;
+    private volatile int aeCompensation = 0;
+    private int minAeComp = 0;
+    private int maxAeComp = 0;
+    private float aeStep = 1.0f / 6.0f;
+    private volatile boolean aeLocked = false;
+    private volatile int awbMode = 1; // CONTROL_AWB_MODE_AUTO
+    private volatile boolean awbLocked = false;
+    private volatile boolean manualFocus = false;
+    private volatile float focusDistance = 0.0f;
+    private float maxFocusDistance = 0.0f;
+    private int[] availableAwbModes = new int[]{1}; // default: AUTO only
+    private LinearLayout manualControlsPanel;
+    private Button manualControlsButton;
+    private TextView zoomLabel, evLabel, focusLabel;
+    private SeekBar zoomSeek, evSeek, focusSeek;
+    private Spinner awbSpinner;
+    private Button aeLockButton, awbLockButton, afModeButton;
     @Override public void onCreate(Bundle savedState) {
         super.onCreate(savedState);
         running = true;
@@ -332,9 +354,20 @@ public final class MainActivity extends Activity {
         micUiButton.setText("MIC: ON");
         styleModernButton(micUiButton, 0xff202d3d, 0xff00d2a0);
         micUiButton.setOnClickListener(v -> toggleMic());
-        LinearLayout.LayoutParams micParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        LinearLayout.LayoutParams micParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        micParams.setMargins(0, 0, 8, 0);
         btnRow3.addView(micUiButton, micParams);
+
+        manualControlsButton = new Button(this);
+        manualControlsButton.setText("Manual Controls");
+        styleModernButton(manualControlsButton, 0xff202d3d, 0xff70e1c1);
+        manualControlsButton.setOnClickListener(v -> toggleManualControlsPanel());
+        LinearLayout.LayoutParams manualParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        manualParams.setMargins(8, 0, 0, 0);
+        btnRow3.addView(manualControlsButton, manualParams);
         root.addView(btnRow3, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        buildManualControlsCard(root);
 
         dimmerOverlay = new View(this);
         dimmerOverlay.setBackgroundColor(0xff000000);
@@ -344,7 +377,11 @@ public final class MainActivity extends Activity {
         buildQrModal();
 
         android.widget.FrameLayout container = new android.widget.FrameLayout(this);
-        container.addView(root, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
+        android.widget.ScrollView scrollView = new android.widget.ScrollView(this);
+        scrollView.setFillViewport(true);
+        scrollView.setVerticalScrollBarEnabled(false);
+        scrollView.addView(root, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.WRAP_CONTENT));
+        container.addView(scrollView, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
         buildMiniViewfinder(container);
         container.addView(dimmerOverlay, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
         container.addView(qrModal, new android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.MATCH_PARENT));
@@ -510,6 +547,33 @@ public final class MainActivity extends Activity {
             setItems(qualitySpinner, List.of("Standard - 60", "High - 75", "Best - 90"));
             qualitySelection = jpegQuality >= 90 ? 2 : jpegQuality >= 75 ? 1 : 0;
             qualitySpinner.setSelection(qualitySelection);
+
+            // Detect manual control capabilities
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                Range<Float> zoomRange = characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+                if (zoomRange != null) { minZoom = zoomRange.getLower(); maxZoom = zoomRange.getUpper(); }
+                else { minZoom = 1.0f; maxZoom = 1.0f; }
+            } else {
+                Float maxDigital = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+                minZoom = 1.0f;
+                maxZoom = (maxDigital != null && maxDigital > 1.0f) ? maxDigital : 1.0f;
+            }
+            Range<Integer> aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+            if (aeRange != null) { minAeComp = aeRange.getLower(); maxAeComp = aeRange.getUpper(); }
+            else { minAeComp = 0; maxAeComp = 0; }
+            android.util.Rational step = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+            if (step != null) aeStep = step.floatValue();
+            Float minFocus = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+            maxFocusDistance = (minFocus != null && minFocus > 0) ? minFocus : 0.0f;
+            int[] awbModes = characteristics.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES);
+            if (awbModes != null && awbModes.length > 0) availableAwbModes = awbModes;
+            else availableAwbModes = new int[]{1};
+
+            // Reset manual controls on camera change
+            zoomRatio = Math.max(minZoom, Math.min(zoomRatio, maxZoom));
+            aeCompensation = Math.max(minAeComp, Math.min(aeCompensation, maxAeComp));
+            if (maxFocusDistance <= 0) manualFocus = false;
+            updateManualControlsUi();
         } catch (CameraAccessException e) { state.setText("Camera settings unavailable: " + e.getMessage()); }
         updatingControls = false;
         if (torchUiButton != null) {
@@ -565,24 +629,304 @@ public final class MainActivity extends Activity {
         if (selectedCamera == null || !selectedCamera.hasFlash) return;
         torchActive = !torchActive;
         if (torchUiButton != null) torchUiButton.setText(torchActive ? "Torch: ON" : "Torch: OFF");
-        applyTorchToSession();
+        updateRepeatingRequest();
     }
 
-    private void applyTorchToSession() {
+    private void applyCaptureParameters(CaptureRequest.Builder builder) {
+        // Zoom
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && maxZoom > 1.0f) {
+            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio);
+        }
+        // Exposure compensation & AE lock
+        builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeCompensation);
+        builder.set(CaptureRequest.CONTROL_AE_LOCK, aeLocked);
+        // White balance
+        builder.set(CaptureRequest.CONTROL_AWB_MODE, awbMode);
+        builder.set(CaptureRequest.CONTROL_AWB_LOCK, awbLocked);
+        // Focus
+        if (manualFocus && maxFocusDistance > 0) {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance);
+        } else {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+        }
+        // FPS range
+        if (selectedFpsRange != null) builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selectedFpsRange);
+        // Noise reduction & edge mode for performance
+        builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST);
+        builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST);
+        // Torch
+        if (selectedCamera != null && selectedCamera.hasFlash && torchActive) {
+            builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
+        } else {
+            builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF);
+        }
+    }
+
+    private void updateRepeatingRequest() {
         if (camera == null || session == null || reader == null) return;
         try {
-            CaptureRequest.Builder request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            CaptureRequest.Builder request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
             request.addTarget(reader.getSurface());
-            request.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
-            if (selectedFpsRange != null) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selectedFpsRange);
-            if (selectedCamera != null && selectedCamera.hasFlash && torchActive) {
-                request.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
-            } else {
-                request.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF);
+            if (encoderSurface != null && encoderRunning) {
+                request.addTarget(encoderSurface);
             }
+            applyCaptureParameters(request);
             session.setRepeatingRequest(request.build(), null, cameraHandler);
         } catch (Exception e) {
-            Log.w("Phonecam", "Failed to apply torch mode", e);
+            Log.w("Phonecam", "Failed to update camera request", e);
+        }
+    }
+
+    // Keep old name as alias for callers in applyRemoteSettings
+    private void applyTorchToSession() { updateRepeatingRequest(); }
+
+    private void toggleManualControlsPanel() {
+        if (manualControlsPanel == null) return;
+        boolean visible = manualControlsPanel.getVisibility() == View.VISIBLE;
+        manualControlsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
+        if (manualControlsButton != null) {
+            manualControlsButton.setText(visible ? "Manual Controls" : "Hide Controls");
+            manualControlsButton.setTextColor(visible ? 0xff70e1c1 : 0xffffffff);
+        }
+    }
+
+    private void buildManualControlsCard(LinearLayout root) {
+        manualControlsPanel = new LinearLayout(this);
+        manualControlsPanel.setOrientation(LinearLayout.VERTICAL);
+        manualControlsPanel.setPadding(24, 16, 24, 16);
+        GradientDrawable cardBg = new GradientDrawable();
+        cardBg.setColor(0xff151e2a);
+        cardBg.setCornerRadius(24);
+        cardBg.setStroke(2, 0xff223142);
+        manualControlsPanel.setBackground(cardBg);
+        manualControlsPanel.setVisibility(View.GONE);
+        LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        cardParams.setMargins(0, 0, 0, 16);
+
+        TextView header = new TextView(this);
+        header.setText("PRO MANUAL CONTROLS");
+        header.setTextSize(12);
+        header.setTypeface(null, android.graphics.Typeface.BOLD);
+        header.setTextColor(0xff70e1c1);
+        header.setPadding(0, 0, 0, 12);
+        manualControlsPanel.addView(header);
+
+        // --- ZOOM ---
+        LinearLayout zoomHeader = new LinearLayout(this);
+        zoomHeader.setOrientation(LinearLayout.HORIZONTAL);
+        zoomHeader.setGravity(Gravity.CENTER_VERTICAL);
+        zoomLabel = new TextView(this);
+        zoomLabel.setText("Zoom: 1.0x");
+        zoomLabel.setTextColor(0xfff0f4f8);
+        zoomLabel.setTextSize(13);
+        zoomLabel.setTypeface(null, android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams zlParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        zoomHeader.addView(zoomLabel, zlParams);
+
+        Button zoomResetBtn = new Button(this);
+        zoomResetBtn.setText("1.0x");
+        styleModernButton(zoomResetBtn, 0xff1e2b3a, 0xff70e1c1);
+        zoomResetBtn.setPadding(16, 6, 16, 6);
+        zoomResetBtn.setTextSize(11);
+        zoomResetBtn.setOnClickListener(v -> {
+            zoomRatio = 1.0f;
+            updateManualControlsUi();
+            updateRepeatingRequest();
+        });
+        zoomHeader.addView(zoomResetBtn);
+        manualControlsPanel.addView(zoomHeader);
+
+        zoomSeek = new SeekBar(this);
+        zoomSeek.setMax(100);
+        zoomSeek.setPadding(10, 12, 10, 16);
+        zoomSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (!fromUser) return;
+                zoomRatio = minZoom + (progress / 100f) * (maxZoom - minZoom);
+                zoomLabel.setText(String.format("Zoom: %.1fx", zoomRatio));
+                updateRepeatingRequest();
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        manualControlsPanel.addView(zoomSeek);
+
+        // --- EXPOSURE COMPENSATION (EV) & AE LOCK ---
+        LinearLayout evHeader = new LinearLayout(this);
+        evHeader.setOrientation(LinearLayout.HORIZONTAL);
+        evHeader.setGravity(Gravity.CENTER_VERTICAL);
+        evLabel = new TextView(this);
+        evLabel.setText("Exposure: 0.0 EV");
+        evLabel.setTextColor(0xfff0f4f8);
+        evLabel.setTextSize(13);
+        evLabel.setTypeface(null, android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams elParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        evHeader.addView(evLabel, elParams);
+
+        aeLockButton = new Button(this);
+        aeLockButton.setText("AE: AUTO");
+        styleModernButton(aeLockButton, 0xff1e2b3a, 0xff8b9bae);
+        aeLockButton.setPadding(16, 6, 16, 6);
+        aeLockButton.setTextSize(11);
+        aeLockButton.setOnClickListener(v -> {
+            aeLocked = !aeLocked;
+            aeLockButton.setText(aeLocked ? "AE: LOCKED" : "AE: AUTO");
+            aeLockButton.setTextColor(aeLocked ? 0xffffbb33 : 0xff8b9bae);
+            updateRepeatingRequest();
+        });
+        evHeader.addView(aeLockButton);
+        manualControlsPanel.addView(evHeader);
+
+        evSeek = new SeekBar(this);
+        evSeek.setMax(100);
+        evSeek.setPadding(10, 12, 10, 16);
+        evSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (!fromUser) return;
+                aeCompensation = minAeComp + Math.round((progress / 100f) * (maxAeComp - minAeComp));
+                evLabel.setText(String.format("Exposure: %+.1f EV", aeCompensation * aeStep));
+                updateRepeatingRequest();
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        manualControlsPanel.addView(evSeek);
+
+        // --- WHITE BALANCE ---
+        LinearLayout awbHeader = new LinearLayout(this);
+        awbHeader.setOrientation(LinearLayout.HORIZONTAL);
+        awbHeader.setGravity(Gravity.CENTER_VERTICAL);
+        TextView awbTitle = new TextView(this);
+        awbTitle.setText("White Balance");
+        awbTitle.setTextColor(0xfff0f4f8);
+        awbTitle.setTextSize(13);
+        awbTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams awbTitleParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        awbHeader.addView(awbTitle, awbTitleParams);
+
+        awbLockButton = new Button(this);
+        awbLockButton.setText("AWB: AUTO");
+        styleModernButton(awbLockButton, 0xff1e2b3a, 0xff8b9bae);
+        awbLockButton.setPadding(16, 6, 16, 6);
+        awbLockButton.setTextSize(11);
+        awbLockButton.setOnClickListener(v -> {
+            awbLocked = !awbLocked;
+            awbLockButton.setText(awbLocked ? "AWB: LOCKED" : "AWB: AUTO");
+            awbLockButton.setTextColor(awbLocked ? 0xffffbb33 : 0xff8b9bae);
+            updateRepeatingRequest();
+        });
+        awbHeader.addView(awbLockButton);
+        manualControlsPanel.addView(awbHeader);
+
+        awbSpinner = new Spinner(this);
+        awbSpinner.setPadding(14, 10, 14, 10);
+        GradientDrawable spBg = new GradientDrawable();
+        spBg.setColor(0xff182230);
+        spBg.setCornerRadius(14);
+        spBg.setStroke(2, 0xff26364a);
+        awbSpinner.setBackground(spBg);
+        setItems(awbSpinner, List.of("Auto", "Incandescent", "Fluorescent", "Daylight", "Cloudy"));
+        awbSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                int[] modes = {1, 2, 3, 5, 6}; // AUTO, INCANDESCENT, FLUORESCENT, DAYLIGHT, CLOUDY_DAYLIGHT
+                if (position >= 0 && position < modes.length) {
+                    awbMode = modes[position];
+                    updateRepeatingRequest();
+                }
+            }
+            @Override public void onNothingSelected(android.widget.AdapterView<?> parent) {}
+        });
+        LinearLayout.LayoutParams spLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        spLp.setMargins(0, 4, 0, 14);
+        manualControlsPanel.addView(awbSpinner, spLp);
+
+        // --- FOCUS ---
+        LinearLayout focusHeader = new LinearLayout(this);
+        focusHeader.setOrientation(LinearLayout.HORIZONTAL);
+        focusHeader.setGravity(Gravity.CENTER_VERTICAL);
+        focusLabel = new TextView(this);
+        focusLabel.setText("Focus: Continuous Auto");
+        focusLabel.setTextColor(0xfff0f4f8);
+        focusLabel.setTextSize(13);
+        focusLabel.setTypeface(null, android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams flParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        focusHeader.addView(focusLabel, flParams);
+
+        afModeButton = new Button(this);
+        afModeButton.setText("Focus: AUTO");
+        styleModernButton(afModeButton, 0xff1e2b3a, 0xff8b9bae);
+        afModeButton.setPadding(16, 6, 16, 6);
+        afModeButton.setTextSize(11);
+        afModeButton.setOnClickListener(v -> {
+            manualFocus = !manualFocus;
+            afModeButton.setText(manualFocus ? "Focus: MANUAL" : "Focus: AUTO");
+            afModeButton.setTextColor(manualFocus ? 0xff70e1c1 : 0xff8b9bae);
+            focusSeek.setEnabled(manualFocus && maxFocusDistance > 0);
+            focusLabel.setText(manualFocus ? String.format("Focus Distance: %.1f dpt", focusDistance) : "Focus: Continuous Auto");
+            updateRepeatingRequest();
+        });
+        focusHeader.addView(afModeButton);
+        manualControlsPanel.addView(focusHeader);
+
+        focusSeek = new SeekBar(this);
+        focusSeek.setMax(100);
+        focusSeek.setPadding(10, 12, 10, 8);
+        focusSeek.setEnabled(false);
+        focusSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (!fromUser || !manualFocus) return;
+                focusDistance = (progress / 100f) * maxFocusDistance;
+                focusLabel.setText(String.format("Focus Distance: %.1f dpt", focusDistance));
+                updateRepeatingRequest();
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        manualControlsPanel.addView(focusSeek);
+
+        root.addView(manualControlsPanel, cardParams);
+    }
+
+    private void updateManualControlsUi() {
+        if (zoomLabel != null) zoomLabel.setText(String.format("Zoom: %.1fx", zoomRatio));
+        if (zoomSeek != null) {
+            zoomSeek.setEnabled(maxZoom > minZoom);
+            if (maxZoom > minZoom) {
+                zoomSeek.setProgress((int) ((zoomRatio - minZoom) / (maxZoom - minZoom) * 100));
+            }
+        }
+        if (evLabel != null) evLabel.setText(String.format("Exposure: %+.1f EV", aeCompensation * aeStep));
+        if (evSeek != null) {
+            evSeek.setEnabled(maxAeComp > minAeComp);
+            if (maxAeComp > minAeComp) {
+                evSeek.setProgress((int) ((float)(aeCompensation - minAeComp) / (maxAeComp - minAeComp) * 100));
+            }
+        }
+        if (aeLockButton != null) {
+            aeLockButton.setText(aeLocked ? "AE: LOCKED" : "AE: AUTO");
+            aeLockButton.setTextColor(aeLocked ? 0xffffbb33 : 0xff8b9bae);
+        }
+        if (awbLockButton != null) {
+            awbLockButton.setText(awbLocked ? "AWB: LOCKED" : "AWB: AUTO");
+            awbLockButton.setTextColor(awbLocked ? 0xffffbb33 : 0xff8b9bae);
+        }
+        if (awbSpinner != null) {
+            int pos = awbMode == 2 ? 1 : awbMode == 3 ? 2 : awbMode == 5 ? 3 : awbMode == 6 ? 4 : 0;
+            if (awbSpinner.getSelectedItemPosition() != pos) awbSpinner.setSelection(pos);
+        }
+        if (afModeButton != null) {
+            afModeButton.setText(manualFocus ? "Focus: MANUAL" : "Focus: AUTO");
+            afModeButton.setTextColor(manualFocus ? 0xff70e1c1 : 0xff8b9bae);
+        }
+        if (focusSeek != null) {
+            focusSeek.setEnabled(manualFocus && maxFocusDistance > 0);
+            if (maxFocusDistance > 0) {
+                focusSeek.setProgress((int) (focusDistance / maxFocusDistance * 100));
+            }
+        }
+        if (focusLabel != null) {
+            focusLabel.setText(manualFocus ? String.format("Focus Distance: %.1f dpt", focusDistance) : "Focus: Continuous Auto");
         }
     }
 
@@ -1059,15 +1403,7 @@ public final class MainActivity extends Activity {
                                     if (activeEncoderSurface != null) {
                                         request.addTarget(activeEncoderSurface);
                                     }
-                                    request.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
-                                    request.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST);
-                                    request.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST);
-                                    if (selectedFpsRange != null) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, selectedFpsRange);
-                                    if (selectedCamera != null && selectedCamera.hasFlash && torchActive) {
-                                        request.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
-                                    } else {
-                                        request.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF);
-                                    }
+                                    applyCaptureParameters(request);
                                     configured.setRepeatingRequest(request.build(), null, cameraHandler);
                                     runOnUiThread(() -> state.setText(front ? "Front camera streaming" : "Back camera streaming"));
                                 } catch (CameraAccessException e) { runOnUiThread(() -> state.setText(e.getMessage())); }
@@ -1768,6 +2104,21 @@ public final class MainActivity extends Activity {
         json.put("torch", torchActive);
         json.put("hasMic", checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED);
         json.put("micMuted", micMuted);
+
+        // Manual camera controls
+        json.put("zoom", (double) zoomRatio);
+        json.put("minZoom", (double) minZoom);
+        json.put("maxZoom", (double) maxZoom);
+        json.put("aeComp", aeCompensation);
+        json.put("minAeComp", minAeComp);
+        json.put("maxAeComp", maxAeComp);
+        json.put("aeStep", (double) aeStep);
+        json.put("aeLocked", aeLocked);
+        json.put("awbMode", awbMode);
+        json.put("awbLocked", awbLocked);
+        json.put("manualFocus", manualFocus);
+        json.put("focusDistance", (double) focusDistance);
+        json.put("maxFocusDistance", (double) maxFocusDistance);
         return json.toString();
     }
 
@@ -1800,6 +2151,39 @@ public final class MainActivity extends Activity {
             }
         }
 
+        boolean manualChanged = false;
+        if (requested.has("zoom")) {
+            float z = (float) requested.optDouble("zoom", zoomRatio);
+            zoomRatio = Math.max(minZoom, Math.min(z, maxZoom));
+            manualChanged = true;
+        }
+        if (requested.has("aeComp")) {
+            int comp = requested.optInt("aeComp", aeCompensation);
+            aeCompensation = Math.max(minAeComp, Math.min(comp, maxAeComp));
+            manualChanged = true;
+        }
+        if (requested.has("aeLocked")) {
+            aeLocked = requested.optBoolean("aeLocked", aeLocked);
+            manualChanged = true;
+        }
+        if (requested.has("awbMode")) {
+            awbMode = requested.optInt("awbMode", awbMode);
+            manualChanged = true;
+        }
+        if (requested.has("awbLocked")) {
+            awbLocked = requested.optBoolean("awbLocked", awbLocked);
+            manualChanged = true;
+        }
+        if (requested.has("manualFocus")) {
+            manualFocus = requested.optBoolean("manualFocus", manualFocus);
+            manualChanged = true;
+        }
+        if (requested.has("focusDistance")) {
+            float fd = (float) requested.optDouble("focusDistance", focusDistance);
+            focusDistance = Math.max(0.0f, Math.min(fd, maxFocusDistance));
+            manualChanged = true;
+        }
+
         cameraSelection = cameraChoices.indexOf(selectedCamera);
         resolutionSelection = sizeChoices.indexOf(selectedSize);
         fpsSelection = fpsChoices.indexOf(selectedFpsRange);
@@ -1812,8 +2196,9 @@ public final class MainActivity extends Activity {
 
         if (cameraChanged || sizeChanged) {
             startCamera();
-        } else if (previousTorch != torchActive) {
-            applyTorchToSession();
+        } else if (previousTorch != torchActive || manualChanged) {
+            updateRepeatingRequest();
+            runOnUiThread(this::updateManualControlsUi);
         }
         return settingsJson();
     }
