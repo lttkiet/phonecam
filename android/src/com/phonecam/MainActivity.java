@@ -683,7 +683,9 @@ public final class MainActivity extends Activity {
                 request.addTarget(encoderSurface);
             }
             applyCaptureParameters(request);
-            session.setRepeatingRequest(request.build(), null, cameraHandler);
+            CaptureRequest builtRequest = request.build();
+            session.capture(builtRequest, null, cameraHandler);
+            session.setRepeatingRequest(builtRequest, null, cameraHandler);
         } catch (Exception e) {
             Log.w("Phonecam", "Failed to update camera request", e);
         }
